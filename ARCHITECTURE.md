@@ -5,7 +5,7 @@ tinytrac is a Cargo workspace with three crates, each depending only on the one 
 | Crate | Role | Status |
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
-| `tinytrac-engine` | SQLite storage, commands, queries, folder sync. | planned |
+| `tinytrac-engine` | SQLite storage, commands, queries; folder sync next. | done |
 | `tinytrac` | Desktop app ([iced](https://iced.rs)) and tray icon. | planned |
 
 The rules live in `core`, where they are tested without a database or a window.
@@ -57,14 +57,31 @@ negative. A positive adjustment counts towards the session's day.
 Time is handled with [jiff](https://docs.rs/jiff): UTC `Timestamp`s for storage and
 time-zone-aware calendar days for reporting.
 
-## Storage and sync (planned)
+## Engine (`tinytrac-engine`)
 
-- Each device keeps its own SQLite database (`rusqlite`, bundled). Changes are
-  committed together with an outgoing change record.
+`Engine` is the one entry point for the UI. Each command (start a timer, edit an
+entry) runs in its own SQLite transaction: load the records, apply the core rules,
+save what changed, and return the changed records so the UI can update in place.
+The engine keeps no domain state in memory; `Timers` is rebuilt for each command.
+
+Storage is a small document store (`rusqlite`, bundled SQLite):
+
+- `records` holds the current revision of every tag, session and the settings,
+  as JSON, plus a few lookup columns derived from sessions (`day`, span, open)
+  for range queries. Deleting writes a tombstone.
+- `changes` gets one row per write: revision id, parent revision, device, body.
+  This is the history sync exchanges.
+- `meta` holds local, unsynced values such as this device's id.
+
+The schema is versioned with `PRAGMA user_version` and plain SQL migrations.
+Settings (break bank on/off and ratio, week start) are a synced record.
+
+## Sync (planned)
+
 - Sync writes each change as an immutable file to a shared folder and imports
   the other devices' files. No file is ever written by two devices, so file-sync
   tools such as Syncthing never produce conflicting copies.
-- Records are merged whole, with parent revisions to tell successive edits from
+- Records are merged whole, using parent revisions to tell successive edits from
   concurrent ones. Concurrent edits get a deterministic winner, and the other
   version is kept and flagged.
 - Sync transports sit behind a small trait, so a server backend can be added later.
@@ -75,3 +92,5 @@ time-zone-aware calendar days for reporting.
 - `crates/tinytrac-core/tests/properties.rs` checks invariants over random timer
   usage, for example "logged time never decreases" and "report totals add up to
   logged time".
+- `crates/tinytrac-engine/tests/engine.rs` drives the engine through its public
+  API with a controllable clock.

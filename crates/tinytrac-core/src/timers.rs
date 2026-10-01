@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
-use jiff::{SignedDuration, Timestamp, Zoned};
+use jiff::{Timestamp, Zoned};
 
 use crate::{Activity, BreakPolicy, Session, SessionError, SessionId, Status, TagId};
 
@@ -121,16 +121,6 @@ impl Timers {
         self.apply(tag, |session| session.end_break(now))
     }
 
-    /// Sets the elapsed time of `tag`'s open session; see [`Session::set_logged`].
-    pub fn set_logged(
-        &mut self,
-        tag: TagId,
-        target: SignedDuration,
-        now: Timestamp,
-    ) -> Result<Session, TimerError> {
-        self.apply(tag, |session| session.set_logged(target, now))
-    }
-
     /// Stops `tag`'s timer and hands back the finished session.
     pub fn stop(&mut self, tag: TagId, now: Timestamp) -> Result<Session, TimerError> {
         let Entry::Occupied(mut entry) = self.open.entry(tag) else {
@@ -170,7 +160,7 @@ fn last_active(session: &Session) -> (Option<Timestamp>, SessionId) {
 
 #[cfg(test)]
 mod tests {
-    use jiff::tz::TimeZone;
+    use jiff::{SignedDuration, tz::TimeZone};
 
     use super::*;
 
@@ -233,19 +223,6 @@ mod tests {
 
         let changed = timers.start(tag, StartMode::Exclusive, None, &at(30));
         assert_eq!(changed[0].status(), Status::Running(Activity::Work));
-    }
-
-    #[test]
-    fn set_logged_edits_an_open_timer() {
-        let tag = TagId::generate();
-        let mut timers = Timers::default();
-        timers.start(tag, StartMode::Exclusive, None, &at(0));
-        timers
-            .set_logged(tag, MIN * 30, at(60).timestamp())
-            .unwrap();
-
-        let paused = timers.pause(tag, at(70).timestamp()).unwrap();
-        assert_eq!(paused.logged(at(70).timestamp()), MIN * 40);
     }
 
     #[test]

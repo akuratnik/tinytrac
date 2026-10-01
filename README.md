@@ -10,7 +10,7 @@ A tiny, native time tracker for work. No browser engine, no account, no server.
 - **Totals**: today and past days at a glance; totals per tag for any range.
 - **Sync** across your own devices through a shared folder (e.g. Syncthing).
 
-> Status: early development. The domain core is done; storage, desktop UI and sync are next.
+> Status: early development. The domain core and storage engine are done; the desktop UI and sync are next.
 
 ## Build
 
