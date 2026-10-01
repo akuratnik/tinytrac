@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tinytrac-core", "crates/tinytrac-engine"]
+members = ["crates/tinytrac-core", "crates/tinytrac-engine", "crates/tinytrac"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,19 @@ repository = "https://github.com/akuratnik/tinytrac"
 
 [workspace.dependencies]
 tinytrac-core = { path = "crates/tinytrac-core" }
+tinytrac-engine = { path = "crates/tinytrac-engine" }
+
+directories = "6"
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "linux-theme-detection",
+    "x11",
+    "wayland",
+    "smol",
+] }
 
 jiff = { version = "0.2", features = ["serde"] }
 proptest = "1"
@@ -17,6 +30,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+iced_test = "0.14"
 thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 

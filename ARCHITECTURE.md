@@ -6,7 +6,7 @@ tinytrac is a Cargo workspace with three crates, each depending only on the one 
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
 | `tinytrac-engine` | SQLite storage, commands, queries; folder sync next. | done |
-| `tinytrac` | Desktop app ([iced](https://iced.rs)) and tray icon. | planned |
+| `tinytrac` | Desktop app ([iced](https://iced.rs)); tray icon next. | done |
 
 The rules live in `core`, where they are tested without a database or a window.
 The UI is a thin layer over engine commands.
@@ -78,6 +78,22 @@ database from a newer version is refused rather than risk damaging it. Write
 transactions take the lock up front (`BEGIN IMMEDIATE`) and wait at most two
 seconds for another writer.
 Settings (break bank on/off and ratio, week start) are a synced record.
+
+## Desktop app (`tinytrac`)
+
+An iced program in the Elm style. `App` owns the `Engine` and routes messages to
+four screens (timers, history, reports, settings). Each screen keeps only its edit
+state (form buffers) and its own `Message` type, and calls the engine in `update`.
+
+After every command the app reloads `Data`, a small snapshot of tags, open timers,
+settings and the last 14 days of sessions. Views compute live values, such as a
+running timer's time or today's totals, from that snapshot on each one-second tick,
+so they never touch the database. Ctrl+click (Cmd on macOS) starts a timer
+alongside the running one.
+
+UI tests (`src/app/tests.rs`) use `iced_test` to drive the real `view` and `update`
+headlessly: they click buttons by label and check what is on screen. Setting
+`TINYTRAC_SNAPSHOTS=<dir>` also saves a PNG of each screen.
 
 ## Sync (planned)
 

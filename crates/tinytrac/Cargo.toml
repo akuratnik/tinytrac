@@ -1,0 +1,21 @@
+[package]
+name = "tinytrac"
+description = "A tiny native time tracker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+directories.workspace = true
+iced.workspace = true
+jiff.workspace = true
+thiserror.workspace = true
+tinytrac-core.workspace = true
+tinytrac-engine.workspace = true
+
+[dev-dependencies]
+iced_test.workspace = true
+
+[lints]
+workspace = true

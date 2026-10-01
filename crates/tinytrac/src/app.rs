@@ -1,0 +1,193 @@
+//! The top-level iced program: routes messages to screens and reloads the
+//! shared data after every command.
+
+use std::{path::Path, time::Duration};
+
+use iced::{
+    Alignment::Center,
+    Element, Fill, Subscription, keyboard, time,
+    widget::{button, column, container, row, scrollable, text},
+};
+use tinytrac_core::DateRange;
+use tinytrac_engine::Engine;
+
+use crate::{
+    data::Data,
+    duration,
+    screen::{self, history, reports, settings, timers},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Track,
+    Reports,
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Tick,
+    ModifiersChanged(keyboard::Modifiers),
+    Show(Screen),
+    DismissError,
+    Timers(timers::Message),
+    History(history::Message),
+    Reports(reports::Message),
+    Settings(settings::Message),
+}
+
+#[derive(Debug)]
+pub struct App {
+    engine: Engine,
+    data: Data,
+    screen: Screen,
+    modifiers: keyboard::Modifiers,
+    error: Option<String>,
+    timers: timers::State,
+    history: history::State,
+    reports: reports::State,
+    settings: settings::State,
+}
+
+impl App {
+    pub fn new(mut engine: Engine) -> screen::Result<Self> {
+        let data = Data::load(&mut engine)?;
+        let mut reports = reports::State::new(&data);
+        reports.reload(&engine, &data)?;
+        Ok(Self {
+            settings: settings::State::new(&data),
+            reports,
+            engine,
+            data,
+            screen: Screen::Track,
+            modifiers: keyboard::Modifiers::default(),
+            error: None,
+            timers: timers::State::default(),
+            history: history::State::default(),
+        })
+    }
+
+    /// Opens the database at `path`, exiting with a message if that fails.
+    pub fn boot(path: &Path) -> Self {
+        Engine::open(path)
+            .map_err(screen::Error::from)
+            .and_then(Self::new)
+            .unwrap_or_else(|error| {
+                eprintln!("tinytrac: cannot open {}: {error}", path.display());
+                std::process::exit(1);
+            })
+    }
+
+    pub fn update(&mut self, message: Message) {
+        let result = match message {
+            Message::Tick => {
+                let now = self.engine.now();
+                if now.date() == self.data.today() {
+                    self.data.now = now;
+                    return;
+                }
+                Ok(())
+            }
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                return;
+            }
+            Message::Show(screen) => {
+                self.screen = screen;
+                self.settings = settings::State::new(&self.data);
+                Ok(())
+            }
+            Message::DismissError => {
+                self.error = None;
+                return;
+            }
+            Message::Timers(message) => {
+                self.timers
+                    .update(message, &mut self.engine, self.modifiers)
+            }
+            Message::History(message) => self.history.update(message, &mut self.engine, &self.data),
+            Message::Reports(message) => self.reports.update(message, &self.engine, &self.data),
+            Message::Settings(message) => {
+                self.settings.update(message, &mut self.engine, &self.data)
+            }
+        };
+        self.error = result
+            .and_then(|()| self.reload())
+            .err()
+            .map(|e| e.to_string());
+    }
+
+    fn reload(&mut self) -> screen::Result {
+        self.data = Data::load(&mut self.engine)?;
+        self.reports.reload(&self.engine, &self.data)
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let today = self.data.totals(DateRange::day(self.data.today())).total();
+        let tab = |label, screen| {
+            let style = if self.screen == screen {
+                button::primary
+            } else {
+                button::text
+            };
+            button(label).style(style).on_press(Message::Show(screen))
+        };
+        let header = row![
+            tab("Track", Screen::Track),
+            tab("Reports", Screen::Reports),
+            tab("Settings", Screen::Settings),
+            text(format!("Today {}", duration::short(today)))
+                .width(Fill)
+                .align_x(iced::Right),
+        ]
+        .spacing(4)
+        .align_y(Center);
+
+        let content: Element<'_, Message> = match self.screen {
+            Screen::Track => column![
+                self.timers.view(&self.data).map(Message::Timers),
+                self.history.view(&self.data).map(Message::History),
+            ]
+            .spacing(28)
+            .into(),
+            Screen::Reports => self.reports.view(&self.data).map(Message::Reports),
+            Screen::Settings => self.settings.view(&self.data).map(Message::Settings),
+        };
+
+        let mut page = column![header].spacing(12).padding(16);
+        if let Some(error) = &self.error {
+            page = page.push(
+                container(
+                    row![
+                        text(error).width(Fill),
+                        button("Dismiss")
+                            .style(button::text)
+                            .on_press(Message::DismissError),
+                    ]
+                    .align_y(Center),
+                )
+                .padding(8)
+                .style(container::danger),
+            );
+        }
+        page.push(scrollable(container(content).padding([0, 4])).height(Fill))
+            .into()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        let modifiers = keyboard::listen().filter_map(|event| match event {
+            keyboard::Event::ModifiersChanged(modifiers) => {
+                Some(Message::ModifiersChanged(modifiers))
+            }
+            _ => None,
+        });
+        // Tick every second while a timer runs; otherwise just often enough to
+        // notice a new day.
+        let period = if self.data.any_running() { 1 } else { 60 };
+        let tick = time::every(Duration::from_secs(period)).map(|_| Message::Tick);
+        Subscription::batch([modifiers, tick])
+    }
+}
+
+#[cfg(test)]
+mod tests;
