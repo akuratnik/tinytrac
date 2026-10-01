@@ -8,7 +8,7 @@ A tiny, native time tracker for work. No browser engine, no account, no server.
   Breaks are logged while you have credit; going over is deducted unless later
   work pays it back.
 - **Totals**: today and past days at a glance; totals per tag for any range.
-- **Sync** across your own devices through a shared folder (e.g. Syncthing).
+- **Sync** across your own devices through a shared folder such as Syncthing (in progress).
 
 > Status: early development. Tracking, editing and reports work; the tray icon and sync are next.
 

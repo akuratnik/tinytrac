@@ -11,7 +11,7 @@ use tinytrac_engine::Engine;
 use crate::{
     data::Data,
     duration,
-    screen::{Result, muted},
+    screen::{Outcome, Result, muted},
 };
 
 #[derive(Debug, Default)]
@@ -21,7 +21,7 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Start(TagId),
+    Start(TagId, StartMode),
     Pause(TagId),
     StartBreak(TagId),
     EndBreak(TagId),
@@ -31,40 +31,46 @@ pub enum Message {
 }
 
 impl State {
-    pub fn update(
-        &mut self,
-        message: Message,
-        engine: &mut Engine,
-        modifiers: keyboard::Modifiers,
-    ) -> Result {
+    pub fn update(&mut self, message: Message, engine: &mut Engine) -> Result {
         match message {
-            Message::Start(tag) => {
-                let mode = if modifiers.command() {
-                    StartMode::Alongside
-                } else {
-                    StartMode::Exclusive
-                };
-                engine.start(tag, mode)?;
-            }
+            Message::Start(tag, mode) => _ = engine.start(tag, mode)?,
             Message::Pause(tag) => _ = engine.pause(tag)?,
             Message::StartBreak(tag) => _ = engine.start_break(tag)?,
             Message::EndBreak(tag) => _ = engine.end_break(tag)?,
             Message::Stop(tag) => _ = engine.stop(tag)?,
-            Message::NewTagChanged(name) => self.new_tag = name,
+            Message::NewTagChanged(name) => {
+                self.new_tag = name;
+                return Ok(Outcome::Edited);
+            }
             Message::CreateTag => {
                 engine.create_tag(&self.new_tag)?;
                 self.new_tag.clear();
             }
         }
-        Ok(())
+        Ok(Outcome::Saved)
     }
 
-    pub fn view<'a>(&'a self, data: &'a Data) -> Element<'a, Message> {
+    /// Rows for every active tag, plus archived ones whose timer is still open.
+    /// Holding Ctrl (Cmd on macOS) makes Start leave other timers running.
+    pub fn view<'a>(
+        &'a self,
+        data: &'a Data,
+        modifiers: keyboard::Modifiers,
+    ) -> Element<'a, Message> {
+        let mode = if modifiers.command() {
+            StartMode::Alongside
+        } else {
+            StartMode::Exclusive
+        };
         let today = data.totals(DateRange::day(data.today())).by_tag();
-        let rows = data.active_tags().map(|tag| {
-            let total = today.get(&tag.id).copied().unwrap_or_default();
-            tag_row(tag, data.timer(tag.id), total, data)
-        });
+        let rows = data
+            .tags
+            .iter()
+            .filter(|tag| !tag.archived || data.timer(tag.id).is_some())
+            .map(|tag| {
+                let total = today.get(&tag.id).copied().unwrap_or_default();
+                tag_row(tag, data.timer(tag.id), total, mode, data)
+            });
         let new_tag = text_input("New tag…", &self.new_tag)
             .on_input(Message::NewTagChanged)
             .on_submit(Message::CreateTag);
@@ -73,65 +79,74 @@ impl State {
     }
 }
 
+/// Two lines: the tag and its timer's clock, then today's total, the break
+/// bank and the controls. Fits a narrow window.
 fn tag_row<'a>(
     tag: &'a Tag,
     timer: Option<&Session>,
     today: jiff::SignedDuration,
+    mode: StartMode,
     data: &Data,
 ) -> Element<'a, Message> {
     let now = data.now.timestamp();
     let id = tag.id;
-    let label = column![
-        text(tag.name()),
-        muted(format!("today {}", duration::short(today)))
-    ];
+    let mut balance = None;
+    let stop = || {
+        button("Stop")
+            .style(button::danger)
+            .on_press(Message::Stop(id))
+    };
+    let mut controls = row![].spacing(4);
+    let mut clock = None;
 
-    let controls: Element<'a, Message> = match timer.map(|session| (session, session.status())) {
+    match timer.map(|session| (session, session.status())) {
         Some((session, Status::Running(activity))) => {
-            let mut buttons = row![].spacing(4).align_y(Center);
-            if let Some(balance) = session.breaks().map(|_| session.tally(now).break_balance()) {
+            if session.breaks().is_some() {
+                balance = Some(session.tally(now).break_balance());
                 let (label, message) = match activity {
                     Activity::Work => ("Break", Message::StartBreak(id)),
                     Activity::Break => ("End break", Message::EndBreak(id)),
                 };
-                buttons = buttons
-                    .push(muted(format!("bank {}", duration::short(balance))))
-                    .push(button(label).style(button::secondary).on_press(message));
+                controls = controls.push(button(label).style(button::secondary).on_press(message));
             }
-            buttons
+            controls = controls
                 .push(
                     button("Pause")
                         .style(button::secondary)
                         .on_press(Message::Pause(id)),
                 )
-                .push(
-                    button("Stop")
-                        .style(button::danger)
-                        .on_press(Message::Stop(id)),
-                )
-                .push(text(duration::clock(session.logged(now))).size(20))
-                .into()
+                .push(stop());
+            clock = Some(text(duration::clock(session.logged(now))).size(20));
         }
-        Some((session, _)) => row![
-            muted(duration::clock(session.logged(now))),
-            button("Resume").on_press(Message::Start(id)),
-            button("Stop")
-                .style(button::danger)
-                .on_press(Message::Stop(id)),
-        ]
-        .spacing(4)
-        .align_y(Center)
-        .into(),
-        None => button("Start").on_press(Message::Start(id)).into(),
-    };
+        Some((session, _)) => {
+            controls = controls
+                .push(button("Resume").on_press(Message::Start(id, mode)))
+                .push(stop());
+            clock = Some(muted(duration::clock(session.logged(now))).size(20));
+        }
+        None => controls = controls.push(button("Start").on_press(Message::Start(id, mode))),
+    }
 
+    let today = duration::short(today);
+    let info = match balance {
+        Some(balance) => format!("today {today} · bank {}", duration::short(balance)),
+        None => format!("today {today}"),
+    };
     let running = timer.is_some_and(|session| matches!(session.status(), Status::Running(_)));
-    container(row![label.width(Fill), controls].spacing(8).align_y(Center))
-        .padding(8)
-        .style(if running {
-            container::rounded_box
-        } else {
-            container::transparent
-        })
-        .into()
+    container(
+        column![
+            row![text(tag.name()).width(Fill)]
+                .push(clock)
+                .align_y(Center),
+            row![muted(info).width(Fill), controls].align_y(Center),
+        ]
+        .spacing(4),
+    )
+    .padding(8)
+    .style(if running {
+        container::rounded_box
+    } else {
+        container::transparent
+    })
+    .into()
 }

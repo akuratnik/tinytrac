@@ -82,14 +82,21 @@ Settings (break bank on/off and ratio, week start) are a synced record.
 ## Desktop app (`tinytrac`)
 
 An iced program in the Elm style. `App` owns the `Engine` and routes messages to
-four screens (timers, history, reports, settings). Each screen keeps only its edit
-state (form buffers) and its own `Message` type, and calls the engine in `update`.
+four screens (timers, history, reports, settings). Each screen keeps its own edit
+state (form buffers; reports also caches its range's sessions) and its own
+`Message` type, and calls the engine in `update`. That returns an `Outcome`:
+`Edited` when only the screen's state changed, such as typing, and `Saved` when
+the engine wrote something. Only saves reload data and clear the error banner, so
+typing never touches the database.
 
-After every command the app reloads `Data`, a small snapshot of tags, open timers,
-settings and the last 14 days of sessions. Views compute live values, such as a
-running timer's time or today's totals, from that snapshot on each one-second tick,
-so they never touch the database. Ctrl+click (Cmd on macOS) starts a timer
-alongside the running one.
+`Data` is a read-only snapshot of tags, open timers, settings and the last 14 days
+of sessions. It is reloaded after every save, on a new day, and every 30 seconds to
+pick up changes made elsewhere. Views compute live values, such as a running timer's
+time or today's totals, from the snapshot on each one-second tick (one-minute when
+nothing runs), so they never touch the database. Forms remember the values they
+opened with and save only what the user changed. Start buttons carry their
+`StartMode`, decided from the modifier keys when the view is built: Ctrl+click
+(Cmd on macOS) starts a timer alongside the running one.
 
 UI tests (`src/app/tests.rs`) use `iced_test` to drive the real `view` and `update`
 headlessly: they click buttons by label and check what is on screen. Setting

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use jiff::{SignedDuration, Zoned, civil::date};
 use tinytrac_core::{Activity, DateRange, StartMode, Status, TagId};
-use tinytrac_engine::{Engine, Error, Settings};
+use tinytrac_engine::{Engine, Error, SessionEdit, WeekStart};
 
 const MIN: SignedDuration = SignedDuration::from_mins(1);
 
@@ -65,6 +65,31 @@ fn tags_are_sorted_and_editable() {
         engine.rename_tag(beta.id, " "),
         Err(Error::Tag(_))
     ));
+    assert!(matches!(
+        engine.create_tag("ALPHA"),
+        Err(Error::DuplicateTag)
+    ));
+    assert!(matches!(
+        engine.rename_tag(beta.id, "alpha"),
+        Err(Error::DuplicateTag)
+    ));
+}
+
+#[test]
+fn a_settings_change_keeps_fields_changed_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tinytrac.db");
+    let mut window = Engine::open(&path).unwrap();
+    let mut elsewhere = Engine::open(&path).unwrap();
+
+    let stale = window.settings().unwrap();
+    elsewhere
+        .update_settings(|s| s.week_start = WeekStart::Sunday)
+        .unwrap();
+    let settings = window.update_settings(|s| s.break_bank = true).unwrap();
+
+    assert_ne!(settings, stale);
+    assert_eq!(settings.week_start, WeekStart::Sunday);
 }
 
 #[test]
@@ -112,11 +137,7 @@ fn starting_a_timer_pauses_the_running_one() {
 fn the_break_bank_follows_settings() {
     let (mut engine, clock) = engine_at("2026-10-01T09:00");
     let tag = engine.create_tag("Acme").unwrap().id;
-    let settings = Settings {
-        break_bank: true,
-        ..Settings::default()
-    };
-    engine.save_settings(&settings).unwrap();
+    let settings = engine.update_settings(|s| s.break_bank = true).unwrap();
     assert_eq!(engine.settings().unwrap(), settings);
 
     engine.start(tag, StartMode::Exclusive).unwrap();
@@ -143,8 +164,11 @@ fn entries_can_be_added_edited_moved_and_deleted() {
     let b = engine.create_tag("B").unwrap().id;
 
     let entry = engine.add_entry(a, date(2026, 10, 1), MIN * 90).unwrap();
-    engine.set_logged(entry.id, MIN * 60).unwrap();
-    engine.retag(entry.id, b).unwrap();
+    let edit = SessionEdit {
+        tag: Some(b),
+        logged: Some(MIN * 60),
+    };
+    engine.edit_session(entry.id, edit).unwrap();
     assert_eq!(engine.totals(today()).unwrap().by_tag()[&b], MIN * 60);
 
     engine.delete_session(entry.id).unwrap();
@@ -166,7 +190,19 @@ fn a_running_timer_cannot_move_to_a_tag_with_its_own_timer() {
     let session = engine.start(a, StartMode::Exclusive).unwrap()[0].id;
     engine.start(b, StartMode::Alongside).unwrap();
 
-    assert!(matches!(engine.retag(session, b), Err(Error::TagBusy)));
+    let edit = SessionEdit {
+        tag: Some(b),
+        logged: Some(MIN),
+    };
+    assert!(matches!(
+        engine.edit_session(session, edit),
+        Err(Error::TagBusy)
+    ));
+    let unchanged = engine.sessions(today()).unwrap();
+    assert!(
+        unchanged.iter().all(|s| s.adjustment().is_zero()),
+        "a failed edit changes nothing"
+    );
 }
 
 #[test]
@@ -205,7 +241,11 @@ fn a_running_timer_can_be_edited_and_deleted() {
     let tag = engine.create_tag("Acme").unwrap().id;
     let session = engine.start(tag, StartMode::Exclusive).unwrap()[0].id;
     clock.advance(60);
-    engine.set_logged(session, MIN * 30).unwrap();
+    let edit = SessionEdit {
+        logged: Some(MIN * 30),
+        ..SessionEdit::default()
+    };
+    engine.edit_session(session, edit).unwrap();
     clock.advance(10);
     assert_eq!(engine.totals(today()).unwrap().total(), MIN * 40);
 
@@ -220,11 +260,7 @@ fn a_running_timer_can_be_edited_and_deleted() {
 #[test]
 fn pausing_and_breaks_round_trip_through_storage() {
     let (mut engine, clock) = engine_at("2026-10-01T09:00");
-    let settings = Settings {
-        break_bank: true,
-        ..Settings::default()
-    };
-    engine.save_settings(&settings).unwrap();
+    engine.update_settings(|s| s.break_bank = true).unwrap();
     let tag = engine.create_tag("Acme").unwrap().id;
 
     engine.start(tag, StartMode::Exclusive).unwrap();

@@ -26,27 +26,23 @@ pub fn clock(duration: SignedDuration) -> String {
 /// Reads what someone typed: `1:30`, `90` (minutes), `1h30m`, `1h 30m`, `2h`, `45m`.
 pub fn parse(input: &str) -> Option<SignedDuration> {
     let input = input.trim().to_lowercase();
+    let number = |text: &str| text.trim().parse::<i64>().ok().filter(|n| *n >= 0);
     let minutes = if let Some((hours, minutes)) = input.split_once(':') {
-        let minutes: i64 = minutes
-            .trim()
-            .parse()
-            .ok()
-            .filter(|m| (0..60).contains(m))?;
-        hours.trim().parse::<i64>().ok()? * 60 + minutes
+        let minutes = number(minutes).filter(|m| *m < 60)?;
+        number(hours)?.checked_mul(60)?.checked_add(minutes)?
     } else if input.contains(['h', 'm']) {
         let (hours, rest) = input.split_once('h').unwrap_or(("0", &input));
-        let minutes = rest.trim().trim_end_matches('m').trim();
-        let hours: i64 = hours.trim().parse().ok()?;
-        let minutes: i64 = if minutes.is_empty() {
+        let minutes = rest.trim().trim_end_matches('m');
+        let minutes = if minutes.trim().is_empty() {
             0
         } else {
-            minutes.parse().ok()?
+            number(minutes)?
         };
-        hours * 60 + minutes
+        number(hours)?.checked_mul(60)?.checked_add(minutes)?
     } else {
-        input.parse().ok()?
+        number(&input)?
     };
-    (minutes >= 0).then(|| SignedDuration::from_mins(minutes))
+    SignedDuration::try_from_mins(minutes)
 }
 
 #[cfg(test)]
@@ -80,7 +76,17 @@ mod tests {
 
     #[test]
     fn rejects_nonsense() {
-        for input in ["", "abc", "1:75", "-5", "h", "1:"] {
+        for input in [
+            "",
+            "abc",
+            "1:75",
+            "-5",
+            "h",
+            "1:",
+            "1h-30m",
+            "999999999999999999",
+            "99999999999999999h",
+        ] {
             assert_eq!(parse(input), None, "{input}");
         }
     }

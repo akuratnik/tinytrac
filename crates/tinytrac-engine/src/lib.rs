@@ -10,6 +10,6 @@ mod error;
 mod settings;
 mod store;
 
-pub use engine::Engine;
+pub use engine::{Engine, SessionEdit};
 pub use error::{Error, Result};
 pub use settings::{Settings, WeekStart};

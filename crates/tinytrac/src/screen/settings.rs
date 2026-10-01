@@ -8,14 +8,16 @@ use iced::{
     widget::{button, column, pick_list, row, text, text_input, toggler},
 };
 use tinytrac_core::{BreakPolicy, TagId};
-use tinytrac_engine::{Engine, Settings, WeekStart};
+use tinytrac_engine::{Engine, WeekStart};
 
 use crate::{
     data::Data,
-    screen::{Error, Result, heading, muted},
+    screen::{Error, Outcome, Result, heading, muted},
 };
 
-/// Edit buffers, filled from the saved settings when the screen opens.
+/// Edit buffers. The ratio is filled from the saved settings when the screen
+/// opens; a tag name is only buffered once the user edits it, so the list
+/// otherwise shows the saved names.
 #[derive(Debug, Default)]
 pub struct State {
     break_minutes: String,
@@ -41,47 +43,63 @@ impl State {
         Self {
             break_minutes: policy.break_minutes.to_string(),
             work_minutes: policy.work_minutes.to_string(),
-            tag_names: data
-                .tags
-                .iter()
-                .map(|tag| (tag.id, tag.name().to_owned()))
-                .collect(),
+            tag_names: BTreeMap::new(),
         }
     }
 
-    pub fn update(&mut self, message: Message, engine: &mut Engine, data: &Data) -> Result {
-        let save = |engine: &mut Engine, change: &dyn Fn(&mut Settings)| {
-            let mut settings = data.settings;
-            change(&mut settings);
-            engine.save_settings(&settings)
-        };
+    pub fn update(&mut self, message: Message, engine: &mut Engine) -> Result {
         match message {
-            Message::BreakBank(on) => save(engine, &|s| s.break_bank = on)?,
-            Message::BreakMinutes(minutes) => self.break_minutes = minutes,
-            Message::WorkMinutes(minutes) => self.work_minutes = minutes,
-            Message::SaveRatio => {
-                let policy = self.policy().ok_or(Error::Input(
-                    "Break and work minutes must be whole numbers; work above zero",
-                ))?;
-                save(engine, &|s| s.break_policy = policy)?;
+            Message::BreakBank(on) => {
+                // Turning the bank on uses the ratio in the fields, saved or not.
+                let policy = if on { Some(self.policy()?) } else { None };
+                engine.update_settings(|settings| {
+                    settings.break_bank = on;
+                    if let Some(policy) = policy {
+                        settings.break_policy = policy;
+                    }
+                })?;
             }
-            Message::WeekStart(start) => save(engine, &|s| s.week_start = start)?,
-            Message::TagName(id, name) => _ = self.tag_names.insert(id, name),
+            Message::SaveRatio => {
+                let policy = self.policy()?;
+                engine.update_settings(|settings| settings.break_policy = policy)?;
+            }
+            Message::WeekStart(start) => {
+                engine.update_settings(|settings| settings.week_start = start)?;
+            }
             Message::RenameTag(id) => {
-                if let Some(name) = self.tag_names.get(&id) {
-                    engine.rename_tag(id, name)?;
-                }
+                let Some(name) = self.tag_names.get(&id) else {
+                    return Ok(Outcome::Edited);
+                };
+                engine.rename_tag(id, name)?;
+                self.tag_names.remove(&id);
             }
             Message::Archive(id, archived) => _ = engine.set_tag_archived(id, archived)?,
+            Message::BreakMinutes(minutes) => {
+                self.break_minutes = minutes;
+                return Ok(Outcome::Edited);
+            }
+            Message::WorkMinutes(minutes) => {
+                self.work_minutes = minutes;
+                return Ok(Outcome::Edited);
+            }
+            Message::TagName(id, name) => {
+                self.tag_names.insert(id, name);
+                return Ok(Outcome::Edited);
+            }
         }
-        Ok(())
+        Ok(Outcome::Saved)
     }
 
-    fn policy(&self) -> Option<BreakPolicy> {
-        Some(BreakPolicy {
-            break_minutes: self.break_minutes.trim().parse().ok()?,
-            work_minutes: self.work_minutes.trim().parse::<NonZeroU32>().ok()?,
-        })
+    fn policy(&self) -> Result<BreakPolicy> {
+        let parse = || {
+            Some(BreakPolicy {
+                break_minutes: self.break_minutes.trim().parse().ok()?,
+                work_minutes: self.work_minutes.trim().parse::<NonZeroU32>().ok()?,
+            })
+        };
+        parse().ok_or(Error::Input(
+            "Break and work minutes must be whole numbers, with work above zero",
+        ))
     }
 
     pub fn view<'a>(&'a self, data: &'a Data) -> Element<'a, Message> {

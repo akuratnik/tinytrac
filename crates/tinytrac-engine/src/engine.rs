@@ -72,16 +72,22 @@ impl Engine {
 
     pub fn create_tag(&mut self, name: &str) -> Result<Tag> {
         let tag = Tag::new(name)?;
-        self.write(|store| store.put(&tag))?;
+        self.write(|store| {
+            ensure_unique_name(store, &tag)?;
+            store.put(&tag)
+        })?;
         Ok(tag)
     }
 
     pub fn rename_tag(&mut self, id: TagId, name: &str) -> Result<Tag> {
-        self.update_tag(id, |tag| Ok(tag.rename(name)?))
+        self.update_tag(id, |tag, store| {
+            tag.rename(name)?;
+            ensure_unique_name(store, tag)
+        })
     }
 
     pub fn set_tag_archived(&mut self, id: TagId, archived: bool) -> Result<Tag> {
-        self.update_tag(id, |tag| {
+        self.update_tag(id, |tag, _| {
             tag.archived = archived;
             Ok(())
         })
@@ -89,17 +95,11 @@ impl Engine {
 
     // Timers
 
-    /// The open timers. Loading them also stops duplicates sync may have
-    /// brought in; see [`Timers::load`].
-    pub fn timers(&mut self) -> Result<Timers> {
+    /// The open timers. Duplicates that sync may bring in show as one and are
+    /// resolved by the next timer command; see [`Timers::load`].
+    pub fn timers(&self) -> Result<Timers> {
         let now = self.now().timestamp();
-        self.write(|store| {
-            let (timers, stopped) = Timers::load(store.open_sessions()?, now);
-            for session in &stopped {
-                store.put(session)?;
-            }
-            Ok(timers)
-        })
+        Ok(Timers::load(self.read(Store::open_sessions)?, now).0)
     }
 
     /// Starts or resumes `tag`'s timer; see [`Timers::start`].
@@ -143,25 +143,25 @@ impl Engine {
         Ok(session)
     }
 
-    /// Sets a session's elapsed time, whether it is running or finished.
-    pub fn set_logged(&mut self, id: SessionId, logged: SignedDuration) -> Result<Session> {
+    /// Applies `edit` to a session, running or finished, in one transaction.
+    pub fn edit_session(&mut self, id: SessionId, edit: SessionEdit) -> Result<Session> {
         let now = self.now().timestamp();
-        self.update_session(id, |session, _| Ok(session.set_logged(logged, now)?))
-    }
-
-    /// Moves a session to another tag.
-    pub fn retag(&mut self, id: SessionId, tag: TagId) -> Result<Session> {
         self.update_session(id, |session, store| {
-            require_tag(store, tag)?;
-            let busy = session.status() != Status::Stopped
-                && store
-                    .open_sessions()?
-                    .iter()
-                    .any(|open| open.tag == tag && open.id != id);
-            if busy {
-                return Err(Error::TagBusy);
+            if let Some(tag) = edit.tag.filter(|tag| *tag != session.tag) {
+                require_tag(store, tag)?;
+                let busy = session.status() != Status::Stopped
+                    && store
+                        .open_sessions()?
+                        .iter()
+                        .any(|open| open.tag == tag && open.id != id);
+                if busy {
+                    return Err(Error::TagBusy);
+                }
+                session.tag = tag;
             }
-            session.tag = tag;
+            if let Some(logged) = edit.logged {
+                session.set_logged(logged, now)?;
+            }
             Ok(())
         })
     }
@@ -201,9 +201,15 @@ impl Engine {
         self.read(Store::settings)
     }
 
-    /// Saves settings. Changes to the break bank apply to timers started afterwards.
-    pub fn save_settings(&mut self, settings: &Settings) -> Result<()> {
-        self.write(|store| store.put(settings))
+    /// Changes the stored settings in place, so a concurrent change to another
+    /// field survives. Break bank changes apply to timers started afterwards.
+    pub fn update_settings(&mut self, change: impl FnOnce(&mut Settings)) -> Result<Settings> {
+        self.write(|store| {
+            let mut settings = store.settings()?;
+            change(&mut settings);
+            store.put(&settings)?;
+            Ok(settings)
+        })
     }
 
     // Helpers
@@ -240,10 +246,14 @@ impl Engine {
         })
     }
 
-    fn update_tag(&mut self, id: TagId, edit: impl FnOnce(&mut Tag) -> Result<()>) -> Result<Tag> {
+    fn update_tag(
+        &mut self,
+        id: TagId,
+        edit: impl FnOnce(&mut Tag, &Store) -> Result<()>,
+    ) -> Result<Tag> {
         self.write(|store| {
             let mut tag = require_tag(store, id)?;
-            edit(&mut tag)?;
+            edit(&mut tag, store)?;
             store.put(&tag)?;
             Ok(tag)
         })
@@ -261,6 +271,28 @@ impl Engine {
             Ok(session)
         })
     }
+}
+
+/// Changes to a session, applied together by [`Engine::edit_session`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionEdit {
+    /// Move the session to this tag.
+    pub tag: Option<TagId>,
+    /// Set the session's elapsed time; see [`Session::set_logged`].
+    pub logged: Option<SignedDuration>,
+}
+
+/// Tag names are unique, ignoring case, so reports never show two alike.
+fn ensure_unique_name(store: &Store, tag: &Tag) -> Result<()> {
+    let name = tag.name().to_lowercase();
+    let taken = store
+        .all::<Tag>()?
+        .iter()
+        .any(|other| other.id != tag.id && other.name().to_lowercase() == name);
+    if taken {
+        return Err(Error::DuplicateTag);
+    }
+    Ok(())
 }
 
 fn require_tag(store: &Store, id: TagId) -> Result<Tag> {

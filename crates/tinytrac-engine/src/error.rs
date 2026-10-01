@@ -18,6 +18,8 @@ pub enum Error {
     NotFound(&'static str),
     #[error("that tag already has an open timer")]
     TagBusy,
+    #[error("a tag with that name already exists")]
+    DuplicateTag,
     #[error("the database was written by a newer version of tinytrac (schema {0})")]
     NewerDatabase(u32),
 }

@@ -21,14 +21,14 @@ pub struct Data {
 }
 
 impl Data {
-    pub fn load(engine: &mut Engine) -> Result<Self> {
+    /// Reads everything the views need. Read-only, so it never waits on writers.
+    pub fn load(engine: &Engine) -> Result<Self> {
         let now = engine.now();
-        let recent = engine.sessions(recent_range(now.date()))?;
         Ok(Self {
             settings: engine.settings()?,
             tags: engine.tags()?,
             timers: engine.timers()?.iter().cloned().collect(),
-            recent,
+            recent: engine.sessions(recent_range(now.date()))?,
             now,
         })
     }

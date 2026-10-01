@@ -14,7 +14,7 @@ use tinytrac_engine::Engine;
 use crate::{
     data::Data,
     duration,
-    screen::{Error, Result, heading, muted},
+    screen::{Error, Outcome, Result, heading, muted},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,11 +75,26 @@ impl State {
         }
     }
 
+    /// Updates the range and reloads its sessions itself, so the app has
+    /// nothing else to reload.
     pub fn update(&mut self, message: Message, engine: &Engine, data: &Data) -> Result {
         match message {
-            Message::Preset(preset) => self.preset = preset,
-            Message::From(from) => self.from = from,
-            Message::To(to) => self.to = to,
+            Message::Preset(preset) => {
+                if preset == Preset::Custom {
+                    // Start from the range on screen.
+                    self.from = self.range.first().to_string();
+                    self.to = self.range.last().to_string();
+                }
+                self.preset = preset;
+            }
+            Message::From(from) => {
+                self.from = from;
+                return Ok(Outcome::Edited);
+            }
+            Message::To(to) => {
+                self.to = to;
+                return Ok(Outcome::Edited);
+            }
             Message::ApplyCustom => {
                 let parse = |input: &str| input.trim().parse::<Date>();
                 let (Ok(from), Ok(to)) = (parse(&self.from), parse(&self.to)) else {
@@ -88,11 +103,12 @@ impl State {
                 self.range = DateRange::new(from, to);
             }
         }
-        self.reload(engine, data)
+        self.reload(engine, data)?;
+        Ok(Outcome::Edited)
     }
 
     /// Reloads the sessions for the current range.
-    pub fn reload(&mut self, engine: &Engine, data: &Data) -> Result {
+    pub fn reload(&mut self, engine: &Engine, data: &Data) -> tinytrac_engine::Result<()> {
         let today = data.today();
         self.range = match self.preset {
             Preset::Today => DateRange::day(today),

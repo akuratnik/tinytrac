@@ -52,6 +52,8 @@ pub enum SessionError {
     NotOnBreak,
     #[error("logged time cannot be negative")]
     NegativeDuration,
+    #[error("a correction can be at most a year")]
+    TooLong,
     #[error("invalid session data: {0}")]
     Invalid(&'static str),
 }
@@ -114,7 +116,7 @@ impl Session {
             day,
             breaks: None,
             segments: Vec::new(),
-            adjustment: logged,
+            adjustment: checked_adjustment(logged)?,
             stopped: true,
         })
     }
@@ -223,12 +225,13 @@ impl Session {
         if target.is_negative() {
             return Err(SessionError::NegativeDuration);
         }
+        let adjustment = checked_adjustment(target - self.tally(now).logged())?;
         // Close the running segment at `now` and reopen it, so a clock that later
         // jumps backwards can't shrink the time this adjustment was measured against.
         if let Status::Running(activity) = self.status() {
             self.switch(activity, now);
         }
-        self.adjustment = target - self.tally(now).logged();
+        self.adjustment = adjustment;
         Ok(())
     }
 
@@ -309,6 +312,17 @@ impl Session {
     }
 }
 
+/// The largest correction a session accepts. A year is far more than any real
+/// edit, and keeps totals nowhere near overflow, even with corrupt data.
+const MAX_ADJUSTMENT: SignedDuration = SignedDuration::from_hours(24 * 366);
+
+fn checked_adjustment(adjustment: SignedDuration) -> Result<SignedDuration, SessionError> {
+    if adjustment.abs() > MAX_ADJUSTMENT {
+        return Err(SessionError::TooLong);
+    }
+    Ok(adjustment)
+}
+
 /// A session as stored, before its invariants are checked.
 #[derive(Deserialize)]
 struct RawSession {
@@ -325,6 +339,7 @@ impl TryFrom<RawSession> for Session {
     type Error = SessionError;
 
     fn try_from(raw: RawSession) -> Result<Self, Self::Error> {
+        checked_adjustment(raw.adjustment)?;
         let invalid = |reason| Err(SessionError::Invalid(reason));
         let mut previous_end = None;
         for (index, segment) in raw.segments.iter().enumerate() {
@@ -582,5 +597,26 @@ mod tests {
             corrupt(|j| j["segments"].as_array_mut().unwrap().reverse()),
             "out of order"
         );
+    }
+
+    #[test]
+    fn corrections_beyond_a_year_are_refused() {
+        let day = jiff::civil::date(2026, 10, 1);
+        let year = SignedDuration::from_hours(24 * 366);
+        assert!(Session::manual(TagId::generate(), day, year).is_ok());
+        let too_long = year + MIN;
+        assert_eq!(
+            Session::manual(TagId::generate(), day, too_long),
+            Err(SessionError::TooLong)
+        );
+
+        let mut session = started(None);
+        assert_eq!(
+            session.set_logged(too_long, at(0)),
+            Err(SessionError::TooLong)
+        );
+        let mut json = serde_json::to_value(&session).unwrap();
+        json["adjustment"] = serde_json::to_value(too_long).unwrap();
+        assert!(serde_json::from_value::<Session>(json).is_err());
     }
 }

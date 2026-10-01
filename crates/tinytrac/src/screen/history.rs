@@ -10,12 +10,12 @@ use iced::{
 };
 use jiff::{SignedDuration, ToSpan, civil::Date};
 use tinytrac_core::{Session, SessionId, Status, TagId};
-use tinytrac_engine::Engine;
+use tinytrac_engine::{Engine, SessionEdit};
 
 use crate::{
     data::{Data, HISTORY_DAYS},
     duration,
-    screen::{Error, Result, heading, muted},
+    screen::{Error, Outcome, Result, heading, muted},
 };
 
 #[derive(Debug, Default)]
@@ -23,13 +23,26 @@ pub struct State {
     form: Option<Form>,
 }
 
-/// The entry being edited, or added when `session` is `None`.
+/// An entry being added or edited.
 #[derive(Debug, Clone)]
 struct Form {
-    session: Option<SessionId>,
+    target: Target,
     tag: Option<TagId>,
-    day: String,
     elapsed: String,
+}
+
+#[derive(Debug, Clone)]
+enum Target {
+    New {
+        day: String,
+    },
+    /// An existing session, with the values the form opened with. Only fields
+    /// the user changed are saved, so a running timer keeps counting.
+    Existing {
+        id: SessionId,
+        tag: TagId,
+        elapsed: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -62,37 +75,51 @@ impl State {
         match message {
             Message::Add => {
                 self.form = Some(Form {
-                    session: None,
+                    target: Target::New {
+                        day: data.today().to_string(),
+                    },
                     tag: data.active_tags().next().map(|tag| tag.id),
-                    day: data.today().to_string(),
                     elapsed: String::new(),
                 });
             }
             Message::Edit(id) => {
-                self.form = data.recent.iter().find(|s| s.id == id).map(|session| Form {
-                    session: Some(id),
-                    tag: Some(session.tag),
-                    day: session.day.to_string(),
-                    elapsed: duration::short(session.logged(data.now.timestamp())),
+                self.form = data.recent.iter().find(|s| s.id == id).map(|session| {
+                    let elapsed = duration::short(session.logged(data.now.timestamp()));
+                    Form {
+                        target: Target::Existing {
+                            id,
+                            tag: session.tag,
+                            elapsed: elapsed.clone(),
+                        },
+                        tag: Some(session.tag),
+                        elapsed,
+                    }
                 });
             }
             Message::Tag(choice) => self.edit(|form| form.tag = Some(choice.id)),
-            Message::Day(day) => self.edit(|form| form.day = day),
+            Message::Day(input) => self.edit(|form| {
+                if let Target::New { day } = &mut form.target {
+                    *day = input;
+                }
+            }),
             Message::Elapsed(elapsed) => self.edit(|form| form.elapsed = elapsed),
+            Message::Cancel => self.form = None,
             Message::Save => {
                 if let Some(form) = &self.form {
-                    form.save(engine, data)?;
+                    form.save(engine)?;
                 }
                 self.form = None;
+                return Ok(Outcome::Saved);
             }
             Message::Delete => {
-                if let Some(id) = self.form.take().and_then(|form| form.session) {
-                    engine.delete_session(id)?;
+                if let Some(Target::Existing { id, .. }) = self.form.as_ref().map(|f| &f.target) {
+                    engine.delete_session(*id)?;
                 }
+                self.form = None;
+                return Ok(Outcome::Saved);
             }
-            Message::Cancel => self.form = None,
         }
-        Ok(())
+        Ok(Outcome::Edited)
     }
 
     pub fn view<'a>(&'a self, data: &'a Data) -> Element<'a, Message> {
@@ -109,7 +136,11 @@ impl State {
         ]
         .spacing(12);
 
-        if let Some(form) = self.form.as_ref().filter(|form| form.session.is_none()) {
+        if let Some(form) = self
+            .form
+            .as_ref()
+            .filter(|f| matches!(f.target, Target::New { .. }))
+        {
             days = days.push(form.view(data));
         }
         for offset in 0..HISTORY_DAYS {
@@ -139,7 +170,7 @@ impl State {
             text(duration::short(total)),
         ];
         let rows = entries.iter().map(|session| match &self.form {
-            Some(form) if form.session == Some(session.id) => form.view(data),
+            Some(form) if form.edits(session.id) => form.view(data),
             _ => entry_row(session, data),
         });
         column![header, column(rows).spacing(2).padding([0, 12])]
@@ -156,15 +187,16 @@ impl State {
 
 fn entry_row<'a>(session: &Session, data: &'a Data) -> Element<'a, Message> {
     let logged = session.logged(data.now.timestamp());
-    let state = match session.status() {
+    let note = match session.status() {
         Status::Running(_) => " · running",
         Status::Paused => " · paused",
+        Status::Stopped if session.segments().is_empty() => " · added",
         Status::Stopped if !session.adjustment().is_zero() => " · edited",
         Status::Stopped => "",
     };
     row![
         text(data.tag_name(session.tag)).width(Fill),
-        muted(state),
+        muted(note),
         text(duration::short(logged)),
         button("Edit")
             .style(button::text)
@@ -176,9 +208,16 @@ fn entry_row<'a>(session: &Session, data: &'a Data) -> Element<'a, Message> {
 }
 
 impl Form {
+    fn edits(&self, session: SessionId) -> bool {
+        matches!(self.target, Target::Existing { id, .. } if id == session)
+    }
+
     fn view<'a>(&'a self, data: &'a Data) -> Element<'a, Message> {
+        // Active tags, plus the entry's own tag even if it has been archived.
         let choices: Vec<TagChoice> = data
-            .active_tags()
+            .tags
+            .iter()
+            .filter(|tag| !tag.archived || Some(tag.id) == self.tag)
             .map(|tag| TagChoice {
                 id: tag.id,
                 name: tag.name().to_owned(),
@@ -187,9 +226,9 @@ impl Form {
         let selected = choices.iter().find(|c| Some(c.id) == self.tag).cloned();
 
         let mut fields = row![pick_list(choices, selected, Message::Tag).width(Fill)].spacing(6);
-        if self.session.is_none() {
+        if let Target::New { day } = &self.target {
             fields = fields.push(
-                text_input("YYYY-MM-DD", &self.day)
+                text_input("YYYY-MM-DD", day)
                     .on_input(Message::Day)
                     .width(120),
             );
@@ -208,7 +247,7 @@ impl Form {
                 .on_press(Message::Cancel),
         ]
         .spacing(6);
-        if self.session.is_some() {
+        if let Target::Existing { .. } = self.target {
             actions = actions.push(
                 button("Delete")
                     .style(button::danger)
@@ -218,27 +257,33 @@ impl Form {
         column![fields, actions].spacing(6).into()
     }
 
-    fn save(&self, engine: &mut Engine, data: &Data) -> Result {
-        let elapsed =
-            duration::parse(&self.elapsed).ok_or(Error::Input("Enter a duration like 1:30"))?;
+    fn save(&self, engine: &mut Engine) -> Result<()> {
         let tag = self.tag.ok_or(Error::Input("Pick a tag"))?;
-        let Some(id) = self.session else {
-            let day: Date = (self.day.trim().parse())
-                .map_err(|_| Error::Input("Enter a day like 2026-10-01"))?;
-            engine.add_entry(tag, day, elapsed)?;
-            return Ok(());
-        };
-        let session = data
-            .recent
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or(Error::Input("That entry no longer exists"))?;
-        if session.tag != tag {
-            engine.retag(id, tag)?;
-        }
-        let shown = duration::short(session.logged(data.now.timestamp()));
-        if self.elapsed.trim() != shown {
-            engine.set_logged(id, elapsed)?;
+        let elapsed =
+            || duration::parse(&self.elapsed).ok_or(Error::Input("Enter a duration like 1:30"));
+        match &self.target {
+            Target::New { day } => {
+                let day: Date = (day.trim().parse())
+                    .map_err(|_| Error::Input("Enter a day like 2026-10-01"))?;
+                engine.add_entry(tag, day, elapsed()?)?;
+            }
+            Target::Existing {
+                id,
+                tag: original_tag,
+                elapsed: original_elapsed,
+            } => {
+                let edit = SessionEdit {
+                    tag: (tag != *original_tag).then_some(tag),
+                    logged: if self.elapsed.trim() == original_elapsed {
+                        None
+                    } else {
+                        Some(elapsed()?)
+                    },
+                };
+                if edit != SessionEdit::default() {
+                    engine.edit_session(*id, edit)?;
+                }
+            }
         }
         Ok(())
     }

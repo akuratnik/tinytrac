@@ -14,7 +14,7 @@ use tinytrac_engine::Engine;
 use crate::{
     data::Data,
     duration,
-    screen::{self, history, reports, settings, timers},
+    screen::{self, Outcome, history, reports, settings, timers},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,7 @@ pub enum Screen {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    Refresh,
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
     DismissError,
@@ -50,8 +51,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mut engine: Engine) -> screen::Result<Self> {
-        let data = Data::load(&mut engine)?;
+    pub fn new(engine: Engine) -> screen::Result<Self> {
+        let data = Data::load(&engine)?;
         let mut reports = reports::State::new(&data);
         reports.reload(&engine, &data)?;
         Ok(Self {
@@ -79,47 +80,63 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) {
-        let result = match message {
-            Message::Tick => {
-                let now = self.engine.now();
-                if now.date() == self.data.today() {
-                    self.data.now = now;
-                    return;
-                }
-                Ok(())
-            }
+        let outcome = match message {
+            Message::Tick => return self.tick(),
+            Message::Refresh => return self.refresh(),
+            Message::Show(screen) => return self.show(screen),
             Message::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers;
                 return;
-            }
-            Message::Show(screen) => {
-                self.screen = screen;
-                self.settings = settings::State::new(&self.data);
-                Ok(())
             }
             Message::DismissError => {
                 self.error = None;
                 return;
             }
-            Message::Timers(message) => {
-                self.timers
-                    .update(message, &mut self.engine, self.modifiers)
-            }
+            Message::Timers(message) => self.timers.update(message, &mut self.engine),
             Message::History(message) => self.history.update(message, &mut self.engine, &self.data),
             Message::Reports(message) => self.reports.update(message, &self.engine, &self.data),
-            Message::Settings(message) => {
-                self.settings.update(message, &mut self.engine, &self.data)
-            }
+            Message::Settings(message) => self.settings.update(message, &mut self.engine),
         };
-        self.error = result
-            .and_then(|()| self.reload())
-            .err()
-            .map(|e| e.to_string());
+        match outcome {
+            Ok(Outcome::Edited) => {}
+            Ok(Outcome::Saved) => {
+                self.error = None;
+                self.refresh();
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+                // A failed command may still have changed something.
+                self.refresh();
+            }
+        }
     }
 
-    fn reload(&mut self) -> screen::Result {
-        self.data = Data::load(&mut self.engine)?;
-        self.reports.reload(&self.engine, &self.data)
+    /// Moves the clock on; a new day also needs fresh data.
+    fn tick(&mut self) {
+        let now = self.engine.now();
+        let new_day = now.date() != self.data.today();
+        self.data.now = now;
+        if new_day {
+            self.refresh();
+        }
+    }
+
+    /// Reloads the data, e.g. after a command or to pick up changes made elsewhere.
+    fn refresh(&mut self) {
+        let reloaded = Data::load(&self.engine).and_then(|data| {
+            self.data = data;
+            self.reports.reload(&self.engine, &self.data)
+        });
+        if let Err(error) = reloaded {
+            self.error = Some(error.to_string());
+        }
+    }
+
+    fn show(&mut self, screen: Screen) {
+        if screen == Screen::Settings && self.screen != Screen::Settings {
+            self.settings = settings::State::new(&self.data);
+        }
+        self.screen = screen;
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -145,7 +162,9 @@ impl App {
 
         let content: Element<'_, Message> = match self.screen {
             Screen::Track => column![
-                self.timers.view(&self.data).map(Message::Timers),
+                self.timers
+                    .view(&self.data, self.modifiers)
+                    .map(Message::Timers),
                 self.history.view(&self.data).map(Message::History),
             ]
             .spacing(28)
@@ -182,10 +201,11 @@ impl App {
             _ => None,
         });
         // Tick every second while a timer runs; otherwise just often enough to
-        // notice a new day.
+        // notice a new day. Refresh now and then to pick up changes made elsewhere.
         let period = if self.data.any_running() { 1 } else { 60 };
         let tick = time::every(Duration::from_secs(period)).map(|_| Message::Tick);
-        Subscription::batch([modifiers, tick])
+        let refresh = time::every(Duration::from_secs(30)).map(|_| Message::Refresh);
+        Subscription::batch([modifiers, tick, refresh])
     }
 }
 

@@ -17,7 +17,16 @@ pub enum Error {
     Input(&'static str),
 }
 
-pub type Result<T = (), E = Error> = std::result::Result<T, E>;
+pub type Result<T = Outcome, E = Error> = std::result::Result<T, E>;
+
+/// What a screen's `update` did, so the app knows whether to reload its data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Only the screen's own state changed, such as typing into a field.
+    Edited,
+    /// The engine saved something.
+    Saved,
+}
 
 pub fn heading(label: &str) -> Text<'_> {
     text(label).size(18)
