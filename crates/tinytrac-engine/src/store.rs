@@ -9,13 +9,18 @@ use serde::{Serialize, de::DeserializeOwned};
 use tinytrac_core::{DateRange, Session, Status, Tag, TimeZone, Timestamp};
 use uuid::Uuid;
 
-use crate::{Result, Settings};
+use crate::{Error, Result, Settings};
 
 const MIGRATIONS: &[&str] = &[include_str!("migrations/001_initial.sql")];
 
-/// Brings the schema up to date, tracking progress in `user_version`.
+/// Brings the schema up to date, tracking progress in `user_version`. Refuses a
+/// database written by a newer version, which this one might damage.
 pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
     let applied: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let supported = u32::try_from(MIGRATIONS.len()).expect("a handful of migrations");
+    if applied > supported {
+        return Err(Error::NewerDatabase(applied));
+    }
     let tx = db.transaction()?;
     for (sql, version) in MIGRATIONS.iter().zip(1_u32..) {
         if version > applied {
@@ -153,7 +158,7 @@ impl<'a> Store<'a> {
                      AND (is_open = 1
                           OR day BETWEEN ?1 AND ?2
                           OR (span_start < ?4 AND span_end >= ?3))
-                   ORDER BY day, span_start";
+                   ORDER BY day, span_start, id";
         self.query(
             sql,
             params![
@@ -169,24 +174,26 @@ impl<'a> Store<'a> {
     fn write(&self, kind: &str, key: &str, body: Option<&str>, index: &Index) -> Result<()> {
         let parent: Option<String> = self
             .db
-            .query_row("SELECT rev FROM records WHERE id = ?1", [key], |row| {
-                row.get(0)
-            })
+            .prepare_cached("SELECT rev FROM records WHERE id = ?1")?
+            .query_row([key], |row| row.get(0))
             .optional()?;
         let rev = Uuid::now_v7().to_string();
-        self.db.execute(
-            "INSERT INTO changes (rev, record, kind, parent, device, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![rev, key, kind, parent, self.device, body],
-        )?;
-        self.db.execute(
-            "INSERT INTO records (id, kind, rev, body, day, span_start, span_end, is_open)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT (id) DO UPDATE SET
-                rev = excluded.rev, body = excluded.body, day = excluded.day,
-                span_start = excluded.span_start, span_end = excluded.span_end,
-                is_open = excluded.is_open",
-            params![
+        self.db
+            .prepare_cached(
+                "INSERT INTO changes (rev, record, kind, parent, device, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![rev, key, kind, parent, self.device, body])?;
+        self.db
+            .prepare_cached(
+                "INSERT INTO records (id, kind, rev, body, day, span_start, span_end, is_open)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (id) DO UPDATE SET
+                    rev = excluded.rev, body = excluded.body, day = excluded.day,
+                    span_start = excluded.span_start, span_end = excluded.span_end,
+                    is_open = excluded.is_open",
+            )?
+            .execute(params![
                 key,
                 kind,
                 rev,
@@ -195,8 +202,7 @@ impl<'a> Store<'a> {
                 index.span_start,
                 index.span_end,
                 index.is_open
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -231,6 +237,13 @@ mod tests {
     }
 
     #[test]
+    fn a_database_from_a_newer_version_is_refused() {
+        let mut db = database();
+        db.pragma_update(None, "user_version", 99).unwrap();
+        assert!(matches!(migrate(&mut db), Err(Error::NewerDatabase(99))));
+    }
+
+    #[test]
     fn the_device_id_is_created_once() {
         let db = database();
         assert_eq!(device_id(&db).unwrap(), device_id(&db).unwrap());
@@ -247,7 +260,7 @@ mod tests {
         store.delete::<Tag>(&tag.key()).unwrap();
 
         let mut statement = db
-            .prepare("SELECT rev, parent, body IS NULL FROM changes ORDER BY rowid")
+            .prepare("SELECT rev, parent, body IS NULL FROM changes ORDER BY seq")
             .unwrap();
         let changes: Vec<(String, Option<String>, bool)> = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))

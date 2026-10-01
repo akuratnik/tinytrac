@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use jiff::{SignedDuration, Zoned, civil::Date};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use tinytrac_core::{DateRange, Session, SessionId, StartMode, Status, Tag, TagId, Timers, Totals};
 
 use crate::{
@@ -40,6 +40,9 @@ impl Engine {
 
     fn with_connection(mut db: Connection) -> Result<Self> {
         db.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+        // Another process may hold the write lock briefly; wait for it, but not
+        // long enough to freeze a UI.
+        db.busy_timeout(Duration::from_secs(2))?;
         store::migrate(&mut db)?;
         let device = store::device_id(&db)?;
         Ok(Self {
@@ -86,39 +89,46 @@ impl Engine {
 
     // Timers
 
-    /// The open timers. Loading them also stops duplicates sync may have brought in.
+    /// The open timers. Loading them also stops duplicates sync may have
+    /// brought in; see [`Timers::load`].
     pub fn timers(&mut self) -> Result<Timers> {
-        let now = self.now();
-        self.write(|store| Ok(load_timers(store, &now)?.0))
+        let now = self.now().timestamp();
+        self.write(|store| {
+            let (timers, stopped) = Timers::load(store.open_sessions()?, now);
+            for session in &stopped {
+                store.put(session)?;
+            }
+            Ok(timers)
+        })
     }
 
     /// Starts or resumes `tag`'s timer; see [`Timers::start`].
     pub fn start(&mut self, tag: TagId, mode: StartMode) -> Result<Vec<Session>> {
-        let breaks = self.read(|store| {
+        self.update_timers(|timers, store, now| {
             require_tag(store, tag)?;
-            Ok(store.settings()?.breaks())
-        })?;
-        self.update_timers(|timers, now| Ok(timers.start(tag, mode, breaks, now)))
+            let breaks = store.settings()?.breaks();
+            Ok(timers.start(tag, mode, breaks, now))
+        })
     }
 
     pub fn pause(&mut self, tag: TagId) -> Result<Vec<Session>> {
-        self.update_timers(|timers, now| Ok(vec![timers.pause(tag, now.timestamp())?]))
+        self.update_timers(|timers, _, now| Ok(vec![timers.pause(tag, now.timestamp())?]))
     }
 
     pub fn pause_all(&mut self) -> Result<Vec<Session>> {
-        self.update_timers(|timers, now| Ok(timers.pause_all(now.timestamp())))
+        self.update_timers(|timers, _, now| Ok(timers.pause_all(now.timestamp())))
     }
 
     pub fn start_break(&mut self, tag: TagId) -> Result<Vec<Session>> {
-        self.update_timers(|timers, now| Ok(vec![timers.start_break(tag, now.timestamp())?]))
+        self.update_timers(|timers, _, now| Ok(vec![timers.start_break(tag, now.timestamp())?]))
     }
 
     pub fn end_break(&mut self, tag: TagId) -> Result<Vec<Session>> {
-        self.update_timers(|timers, now| Ok(vec![timers.end_break(tag, now.timestamp())?]))
+        self.update_timers(|timers, _, now| Ok(vec![timers.end_break(tag, now.timestamp())?]))
     }
 
     pub fn stop(&mut self, tag: TagId) -> Result<Vec<Session>> {
-        self.update_timers(|timers, now| Ok(vec![timers.stop(tag, now.timestamp())?]))
+        self.update_timers(|timers, _, now| Ok(vec![timers.stop(tag, now.timestamp())?]))
     }
 
     // Entries
@@ -165,16 +175,18 @@ impl Engine {
 
     // Reports
 
-    /// Sessions that log time within `range`, ordered by day.
+    /// Every session that may log time within `range`: what
+    /// [`Totals::compute`] needs. That includes all open timers and sessions
+    /// that merely touch the range, so filter by `day` to list a day's entries.
     pub fn sessions(&self, range: DateRange) -> Result<Vec<Session>> {
-        let tz = self.now().time_zone().clone();
-        self.read(|store| store.sessions_in(range, &tz))
+        let now = self.now();
+        self.read(|store| store.sessions_in(range, now.time_zone()))
     }
 
     /// Logged time per day and tag within `range`.
     pub fn totals(&self, range: DateRange) -> Result<Totals> {
         let now = self.now();
-        let sessions = self.sessions(range)?;
+        let sessions = self.read(|store| store.sessions_in(range, now.time_zone()))?;
         Ok(Totals::compute(
             &sessions,
             range,
@@ -200,22 +212,27 @@ impl Engine {
         query(&Store::new(&self.db, &self.device))
     }
 
+    /// Runs `command` in a transaction that takes the write lock up front, so it
+    /// can't fail halfway when another connection writes.
     fn write<T>(&mut self, command: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let output = command(&Store::new(&tx, &self.device))?;
         tx.commit()?;
         Ok(output)
     }
 
-    /// Loads the timers, applies `action`, and persists every session it changed.
+    /// Loads the timers, applies `action`, and persists every session that
+    /// changed, including duplicates that loading stopped.
     fn update_timers(
         &mut self,
-        action: impl FnOnce(&mut Timers, &Zoned) -> Result<Vec<Session>>,
+        action: impl FnOnce(&mut Timers, &Store, &Zoned) -> Result<Vec<Session>>,
     ) -> Result<Vec<Session>> {
         let now = self.now();
         self.write(|store| {
-            let (mut timers, mut changed) = load_timers(store, &now)?;
-            changed.extend(action(&mut timers, &now)?);
+            let (mut timers, mut changed) = Timers::load(store.open_sessions()?, now.timestamp());
+            changed.extend(action(&mut timers, store, &now)?);
             for session in &changed {
                 store.put(session)?;
             }
@@ -244,16 +261,6 @@ impl Engine {
             Ok(session)
         })
     }
-}
-
-/// Loads the open timers, persisting any duplicates [`Timers::load`] stopped.
-/// Returns those stopped sessions too, as they changed.
-fn load_timers(store: &Store, now: &Zoned) -> Result<(Timers, Vec<Session>)> {
-    let (timers, stopped) = Timers::load(store.open_sessions()?, now.timestamp());
-    for session in &stopped {
-        store.put(session)?;
-    }
-    Ok((timers, stopped))
 }
 
 fn require_tag(store: &Store, id: TagId) -> Result<Tag> {
@@ -286,7 +293,17 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(engine.timers().unwrap().iter().count(), 1);
+        let revisions = |engine: &Engine| -> i64 {
+            engine
+                .db
+                .query_row("SELECT count(*) FROM changes", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = revisions(&engine);
+        let changed = engine.pause_all().unwrap();
+
+        assert_eq!(changed.len(), 2, "the duplicate stopped, the other paused");
+        assert_eq!(revisions(&engine) - before, 2, "one revision per change");
         assert_eq!(engine.read(Store::open_sessions).unwrap().len(), 1);
     }
 }

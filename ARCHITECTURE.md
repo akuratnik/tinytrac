@@ -73,7 +73,10 @@ Storage is a small document store (`rusqlite`, bundled SQLite):
   This is the history sync exchanges.
 - `meta` holds local, unsynced values such as this device's id.
 
-The schema is versioned with `PRAGMA user_version` and plain SQL migrations.
+The schema is versioned with `PRAGMA user_version` and plain SQL migrations. A
+database from a newer version is refused rather than risk damaging it. Write
+transactions take the lock up front (`BEGIN IMMEDIATE`) and wait at most two
+seconds for another writer.
 Settings (break bank on/off and ratio, week start) are a synced record.
 
 ## Sync (planned)
@@ -85,6 +88,14 @@ Settings (break bank on/off and ratio, week start) are a synced record.
   concurrent ones. Concurrent edits get a deterministic winner, and the other
   version is kept and flagged.
 - Sync transports sit behind a small trait, so a server backend can be added later.
+- The database itself never lives in the synced folder; file-sync tools and
+  SQLite's write-ahead log don't mix.
+- Imports keep the incoming revision ids and parents (unlike local writes, which
+  mint new ones), validate each body before writing it, and check that a record
+  never changes kind. Duplicate open timers can only arrive through imports,
+  where they will be resolved.
+- The device id must survive copying a database to another machine, so that two
+  devices never write as one.
 
 ## Testing
 

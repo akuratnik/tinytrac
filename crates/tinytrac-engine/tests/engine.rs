@@ -198,3 +198,45 @@ fn unknown_records_are_reported() {
         Err(Error::NotFound("tag"))
     ));
 }
+
+#[test]
+fn a_running_timer_can_be_edited_and_deleted() {
+    let (mut engine, clock) = engine_at("2026-10-01T09:00");
+    let tag = engine.create_tag("Acme").unwrap().id;
+    let session = engine.start(tag, StartMode::Exclusive).unwrap()[0].id;
+    clock.advance(60);
+    engine.set_logged(session, MIN * 30).unwrap();
+    clock.advance(10);
+    assert_eq!(engine.totals(today()).unwrap().total(), MIN * 40);
+
+    engine.delete_session(session).unwrap();
+    assert!(engine.timers().unwrap().get(tag).is_none());
+    assert_eq!(
+        engine.totals(today()).unwrap().total(),
+        SignedDuration::ZERO
+    );
+}
+
+#[test]
+fn pausing_and_breaks_round_trip_through_storage() {
+    let (mut engine, clock) = engine_at("2026-10-01T09:00");
+    let settings = Settings {
+        break_bank: true,
+        ..Settings::default()
+    };
+    engine.save_settings(&settings).unwrap();
+    let tag = engine.create_tag("Acme").unwrap().id;
+
+    engine.start(tag, StartMode::Exclusive).unwrap();
+    clock.advance(50);
+    engine.start_break(tag).unwrap();
+    clock.advance(5);
+    engine.end_break(tag).unwrap();
+    clock.advance(5);
+    engine.pause(tag).unwrap();
+    clock.advance(30);
+
+    let timers = engine.timers().unwrap();
+    assert_eq!(timers.get(tag).unwrap().status(), Status::Paused);
+    assert_eq!(engine.totals(today()).unwrap().total(), MIN * 60);
+}

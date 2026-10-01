@@ -1,3 +1,5 @@
+use std::fmt;
+
 use jiff::civil::Weekday;
 use serde::{Deserialize, Serialize};
 use tinytrac_core::BreakPolicy;
@@ -34,5 +36,14 @@ impl From<WeekStart> for Weekday {
             WeekStart::Monday => Weekday::Monday,
             WeekStart::Sunday => Weekday::Sunday,
         }
+    }
+}
+
+impl fmt::Display for WeekStart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            WeekStart::Monday => "Monday",
+            WeekStart::Sunday => "Sunday",
+        })
     }
 }

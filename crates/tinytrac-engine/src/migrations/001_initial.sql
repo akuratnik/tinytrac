@@ -23,9 +23,11 @@ CREATE INDEX records_by_span ON records (kind, span_start);
 CREATE INDEX records_open ON records (kind, is_open);
 
 -- Every revision written on this device or imported from another: the history
--- that sync exchanges. `parent` is the revision it replaced.
+-- that sync exchanges. `parent` is the revision it replaced; `seq` is the order
+-- revisions arrived in this database.
 CREATE TABLE changes (
-    rev      TEXT PRIMARY KEY,
+    seq      INTEGER PRIMARY KEY,
+    rev      TEXT NOT NULL UNIQUE,
     record   TEXT NOT NULL,
     kind     TEXT NOT NULL,
     parent   TEXT,
@@ -33,3 +35,6 @@ CREATE TABLE changes (
     body     TEXT,
     exported INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+
+CREATE INDEX changes_by_record ON changes (record);
+CREATE INDEX changes_unexported ON changes (exported) WHERE exported = 0;
