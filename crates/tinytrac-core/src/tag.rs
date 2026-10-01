@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::TagId;
 
@@ -7,6 +7,7 @@ use crate::TagId;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tag {
     pub id: TagId,
+    #[serde(deserialize_with = "deserialize_name")]
     name: String,
     /// Archived tags are hidden from pickers but keep their history.
     pub archived: bool,
@@ -57,6 +58,10 @@ fn validate(name: &str) -> Result<String, TagError> {
     Ok(name.to_owned())
 }
 
+fn deserialize_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    validate(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +72,12 @@ mod tests {
         assert_eq!(tag.name(), "Acme");
         assert_eq!(tag.rename("   "), Err(TagError::EmptyName));
         assert_eq!(tag.name(), "Acme");
+    }
+
+    #[test]
+    fn blank_names_are_rejected_when_deserializing() {
+        let mut json = serde_json::to_value(Tag::new("Acme").unwrap()).unwrap();
+        json["name"] = " ".into();
+        assert!(serde_json::from_value::<Tag>(json).is_err());
     }
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// How much break time work earns: `break_minutes` of break per `work_minutes` of work.
 ///
 /// Credit accrues continuously, so 10 minutes of work under the default policy
-/// earns 2 minutes of break.
+/// earns 2 minutes of break. Zero `break_minutes` is allowed and earns nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BreakPolicy {
     pub break_minutes: u32,

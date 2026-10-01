@@ -1,7 +1,8 @@
 //! Domain model for tinytrac.
 //!
-//! This crate is pure: no storage, no UI, no clock. Every operation that depends
-//! on the current time takes it as a parameter, which keeps the rules easy to test.
+//! This crate has no storage and no UI. Every rule that depends on the current
+//! time takes it as a parameter, which keeps the rules easy to test. (New ids are
+//! time-ordered UUIDs, the one place the system clock is read.)
 //!
 //! - [`Tag`] is what time is tracked against (a client, a project, a category).
 //! - [`Session`] is one timer's run for a tag: work and break segments, optional

@@ -4,7 +4,7 @@ tinytrac is a Cargo workspace with three crates, each depending only on the one 
 
 | Crate | Role | Status |
 |---|---|---|
-| `tinytrac-core` | Domain rules: tags, timers, break bank, reports. Pure: no I/O, no clock. | done |
+| `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
 | `tinytrac-engine` | SQLite storage, commands, queries, folder sync. | planned |
 | `tinytrac` | Desktop app ([iced](https://iced.rs)) and tray icon. | planned |
 
@@ -38,16 +38,21 @@ the balance. Stopping ends the session and discards any unused credit.
 
 Editing an entry's elapsed time sets `adjustment` to the difference between the
 new value and the recorded time. The recorded segments stay as they were. Manual
-entries are sessions with no segments and only an adjustment.
+entries are sessions with no segments and only an adjustment. Sessions are
+validated when deserialized, so a corrupt or synced record can't break these
+rules.
 
-**Timers**: the open sessions, at most one per tag. Starting a timer pauses the
-others (`StartMode::Exclusive`) unless it is started alongside them
-(`StartMode::Alongside`). Every mutating call returns the sessions it changed, so
-the engine persists exactly those.
+**Timers**: the open sessions, one per tag. Starting a timer pauses the others
+(`StartMode::Exclusive`) unless it is started alongside them
+(`StartMode::Alongside`). Starting a timer that is on a break ends the break. Every
+mutating call returns the sessions it changed, so the engine persists exactly
+those. If two offline devices each opened a session for the same tag, loading
+keeps the most recently active one and stops the other, keeping its time.
 
 **Totals**: logged time per day and tag over a `DateRange`. Recorded time is cut at
-local midnight (DST-aware). Covered break is assigned to break segments in order, and
-adjustments count towards the session's day.
+local midnight (DST-aware). Covered break is assigned to break segments in order. A
+negative adjustment trims counted time from the end of the session, so no day goes
+negative. A positive adjustment counts towards the session's day.
 
 Time is handled with [jiff](https://docs.rs/jiff): UTC `Timestamp`s for storage and
 time-zone-aware calendar days for reporting.

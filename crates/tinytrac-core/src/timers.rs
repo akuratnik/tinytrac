@@ -1,6 +1,8 @@
-use jiff::{Timestamp, Zoned};
+use std::collections::{BTreeMap, btree_map::Entry};
 
-use crate::{BreakPolicy, Session, SessionError, Status, TagId};
+use jiff::{SignedDuration, Timestamp, Zoned};
+
+use crate::{Activity, BreakPolicy, Session, SessionError, SessionId, Status, TagId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TimerError {
@@ -19,35 +21,59 @@ pub enum StartMode {
     Alongside,
 }
 
-/// The open (not yet stopped) sessions, at most one per tag.
+/// The open (not yet stopped) sessions, one per tag.
 ///
 /// Every change goes through a method that returns the sessions it touched, so
 /// callers know exactly what to persist.
 #[derive(Debug, Clone, Default)]
 pub struct Timers {
-    open: Vec<Session>,
+    open: BTreeMap<TagId, Session>,
 }
 
 impl Timers {
-    /// Wraps the open sessions. Stopped sessions are ignored.
-    pub fn new(sessions: impl IntoIterator<Item = Session>) -> Self {
-        let open = sessions
-            .into_iter()
-            .filter(|session| session.status() != Status::Stopped)
-            .collect();
-        Self { open }
+    /// Builds the timers from stored sessions, skipping stopped ones.
+    ///
+    /// Two devices that were offline can each open a session for the same tag.
+    /// The most recently active one is kept and the others are stopped at `now`,
+    /// keeping their recorded time. Returns those stopped sessions for persisting.
+    pub fn load(
+        sessions: impl IntoIterator<Item = Session>,
+        now: Timestamp,
+    ) -> (Self, Vec<Session>) {
+        let mut open = BTreeMap::new();
+        let mut stopped = Vec::new();
+        for session in sessions {
+            if session.status() == Status::Stopped {
+                continue;
+            }
+            let mut older = match open.entry(session.tag) {
+                Entry::Vacant(entry) => {
+                    entry.insert(session);
+                    continue;
+                }
+                Entry::Occupied(mut entry) if last_active(&session) > last_active(entry.get()) => {
+                    entry.insert(session)
+                }
+                Entry::Occupied(_) => session,
+            };
+            if older.stop(now).is_ok() {
+                stopped.push(older);
+            }
+        }
+        (Self { open }, stopped)
     }
 
+    /// The open sessions, ordered by tag.
     pub fn iter(&self) -> impl Iterator<Item = &Session> {
-        self.open.iter()
+        self.open.values()
     }
 
     pub fn get(&self, tag: TagId) -> Option<&Session> {
-        self.position(tag).map(|index| &self.open[index])
+        self.open.get(&tag)
     }
 
-    /// Starts `tag`'s timer, resuming its open session if there is one.
-    /// `breaks` applies only if a new session is created.
+    /// Starts working on `tag`: resumes its paused session, ends its break, or
+    /// opens a new session with `breaks`.
     ///
     /// Returns every session that changed, for persisting.
     pub fn start(
@@ -57,19 +83,23 @@ impl Timers {
         breaks: Option<BreakPolicy>,
         now: &Zoned,
     ) -> Vec<Session> {
+        let at = now.timestamp();
         let mut changed = match mode {
-            StartMode::Exclusive => self.pause_where(now.timestamp(), |s| s.tag != tag),
+            StartMode::Exclusive => self.pause_where(at, |other| other != tag),
             StartMode::Alongside => Vec::new(),
         };
-        if let Some(index) = self.position(tag) {
-            let session = &mut self.open[index];
-            if session.resume(now.timestamp()).is_ok() {
+        if let Some(session) = self.open.get_mut(&tag) {
+            let started = match session.status() {
+                Status::Running(Activity::Break) => session.end_break(at),
+                _ => session.resume(at),
+            };
+            if started.is_ok() {
                 changed.push(session.clone());
             }
         } else {
             let session = Session::start(tag, breaks, now);
             changed.push(session.clone());
-            self.open.push(session);
+            self.open.insert(tag, session);
         }
         changed
     }
@@ -91,12 +121,23 @@ impl Timers {
         self.apply(tag, |session| session.end_break(now))
     }
 
+    /// Sets the elapsed time of `tag`'s open session; see [`Session::set_logged`].
+    pub fn set_logged(
+        &mut self,
+        tag: TagId,
+        target: SignedDuration,
+        now: Timestamp,
+    ) -> Result<Session, TimerError> {
+        self.apply(tag, |session| session.set_logged(target, now))
+    }
+
     /// Stops `tag`'s timer and hands back the finished session.
     pub fn stop(&mut self, tag: TagId, now: Timestamp) -> Result<Session, TimerError> {
-        let index = self.position(tag).ok_or(TimerError::NoTimer)?;
-        let mut session = self.open.swap_remove(index);
-        session.stop(now)?;
-        Ok(session)
+        let Entry::Occupied(mut entry) = self.open.entry(tag) else {
+            return Err(TimerError::NoTimer);
+        };
+        entry.get_mut().stop(now)?;
+        Ok(entry.remove())
     }
 
     fn apply(
@@ -104,42 +145,49 @@ impl Timers {
         tag: TagId,
         action: impl FnOnce(&mut Session) -> Result<(), SessionError>,
     ) -> Result<Session, TimerError> {
-        let index = self.position(tag).ok_or(TimerError::NoTimer)?;
-        let session = &mut self.open[index];
+        let session = self.open.get_mut(&tag).ok_or(TimerError::NoTimer)?;
         action(session)?;
         Ok(session.clone())
     }
 
-    fn position(&self, tag: TagId) -> Option<usize> {
-        self.open.iter().position(|session| session.tag == tag)
-    }
-
-    fn pause_where(&mut self, now: Timestamp, filter: impl Fn(&Session) -> bool) -> Vec<Session> {
+    fn pause_where(&mut self, now: Timestamp, filter: impl Fn(TagId) -> bool) -> Vec<Session> {
         self.open
             .iter_mut()
-            .filter(|session| filter(session))
-            .filter_map(|session| session.pause(now).is_ok().then(|| session.clone()))
+            .filter(|(tag, _)| filter(**tag))
+            .filter_map(|(_, session)| session.pause(now).is_ok().then(|| session.clone()))
             .collect()
     }
 }
 
+/// When a session last changed state, with the id as a deterministic tiebreak.
+fn last_active(session: &Session) -> (Option<Timestamp>, SessionId) {
+    let last = session.segments().last();
+    (
+        last.map(|segment| segment.end.unwrap_or(segment.start)),
+        session.id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use jiff::{SignedDuration, tz::TimeZone};
+    use jiff::tz::TimeZone;
 
     use super::*;
-    use crate::Activity;
+
+    const MIN: SignedDuration = SignedDuration::from_mins(1);
 
     fn at(minute: i64) -> Zoned {
-        (Timestamp::UNIX_EPOCH + SignedDuration::from_mins(minute)).to_zoned(TimeZone::UTC)
+        (Timestamp::UNIX_EPOCH + MIN * i32::try_from(minute).unwrap()).to_zoned(TimeZone::UTC)
     }
 
     fn running(timers: &Timers) -> Vec<TagId> {
-        timers
+        let mut tags: Vec<_> = timers
             .iter()
             .filter(|s| s.status() == Status::Running(Activity::Work))
             .map(|s| s.tag)
-            .collect()
+            .collect();
+        tags.sort();
+        tags
     }
 
     #[test]
@@ -153,7 +201,9 @@ mod tests {
         assert_eq!(running(&timers), [b]);
 
         timers.start(c, StartMode::Alongside, None, &at(20));
-        assert_eq!(running(&timers), [b, c]);
+        let mut both = [b, c];
+        both.sort();
+        assert_eq!(running(&timers), both);
     }
 
     #[test]
@@ -167,6 +217,35 @@ mod tests {
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].id, first);
         assert_eq!(timers.iter().count(), 1);
+    }
+
+    #[test]
+    fn starting_a_timer_on_a_break_ends_the_break() {
+        let tag = TagId::generate();
+        let mut timers = Timers::default();
+        timers.start(
+            tag,
+            StartMode::Exclusive,
+            Some(BreakPolicy::default()),
+            &at(0),
+        );
+        timers.start_break(tag, at(25).timestamp()).unwrap();
+
+        let changed = timers.start(tag, StartMode::Exclusive, None, &at(30));
+        assert_eq!(changed[0].status(), Status::Running(Activity::Work));
+    }
+
+    #[test]
+    fn set_logged_edits_an_open_timer() {
+        let tag = TagId::generate();
+        let mut timers = Timers::default();
+        timers.start(tag, StartMode::Exclusive, None, &at(0));
+        timers
+            .set_logged(tag, MIN * 30, at(60).timestamp())
+            .unwrap();
+
+        let paused = timers.pause(tag, at(70).timestamp()).unwrap();
+        assert_eq!(paused.logged(at(70).timestamp()), MIN * 40);
     }
 
     #[test]
@@ -186,14 +265,24 @@ mod tests {
         timers.start(tag, StartMode::Exclusive, None, &at(0));
 
         let finished = timers.stop(tag, at(30).timestamp()).unwrap();
-        assert_eq!(
-            finished.logged(at(99).timestamp()),
-            SignedDuration::from_mins(30)
-        );
+        assert_eq!(finished.logged(at(99).timestamp()), MIN * 30);
         assert!(timers.get(tag).is_none());
         assert_eq!(
             timers.stop(tag, at(40).timestamp()),
             Err(TimerError::NoTimer)
         );
+    }
+
+    #[test]
+    fn loading_two_open_sessions_for_one_tag_keeps_the_latest() {
+        let tag = TagId::generate();
+        let desktop = Session::start(tag, None, &at(0));
+        let laptop = Session::start(tag, None, &at(5));
+
+        let (timers, stopped) = Timers::load([laptop.clone(), desktop.clone()], at(10).timestamp());
+        assert_eq!(timers.get(tag).map(|s| s.id), Some(laptop.id));
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].id, desktop.id);
+        assert_eq!(stopped[0].logged(at(99).timestamp()), MIN * 10);
     }
 }

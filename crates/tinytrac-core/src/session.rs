@@ -52,6 +52,8 @@ pub enum SessionError {
     NotOnBreak,
     #[error("logged time cannot be negative")]
     NegativeDuration,
+    #[error("invalid session data: {0}")]
+    Invalid(&'static str),
 }
 
 /// One timer's run for a tag, from start until stop.
@@ -65,12 +67,16 @@ pub enum SessionError {
 /// time counts as logged only while covered by credit; uncovered break time is
 /// an overdraft that later work can still pay back. Credit lives and dies with
 /// the session: it survives pauses and is discarded on stop.
+///
+/// Deserializing checks the same invariants the methods maintain, so data from
+/// disk or another device can't produce a session the rules don't allow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSession")]
 pub struct Session {
     pub id: SessionId,
     pub tag: TagId,
     /// The day the session belongs to: the day it started, or the chosen day of
-    /// a manual entry. Adjustments count towards this day.
+    /// a manual entry. Positive adjustments count towards this day.
     pub day: Date,
     /// Captured at start so later settings changes don't rewrite history.
     breaks: Option<BreakPolicy>,
@@ -207,7 +213,8 @@ impl Session {
     }
 
     /// Corrects the session so it logs exactly `target` as of `now`. A running
-    /// session keeps counting from there.
+    /// session keeps counting from there, including any break overdraft that
+    /// later work pays back.
     pub fn set_logged(
         &mut self,
         target: SignedDuration,
@@ -216,29 +223,54 @@ impl Session {
         if target.is_negative() {
             return Err(SessionError::NegativeDuration);
         }
+        // Close the running segment at `now` and reopen it, so a clock that later
+        // jumps backwards can't shrink the time this adjustment was measured against.
+        if let Status::Running(activity) = self.status() {
+            self.switch(activity, now);
+        }
         self.adjustment = target - self.tally(now).logged();
         Ok(())
     }
 
-    /// The recorded spans that count as logged time: all work, plus break time
-    /// up to the earned credit, applied to breaks in chronological order. The
-    /// adjustment is not included, as it has no position in time.
-    pub fn counted(&self, now: Timestamp) -> impl Iterator<Item = Interval> + '_ {
+    /// The spans of time this session logs as of `now`: all work, plus break
+    /// time up to the earned credit (applied to breaks in order), with a negative
+    /// adjustment trimmed off the end. A positive adjustment has no position in
+    /// time, so it is not included.
+    pub fn counted(&self, now: Timestamp) -> Vec<Interval> {
         let mut allowance = self.tally(now).break_covered();
-        self.segments.iter().filter_map(move |segment| {
-            let interval = segment.interval(now);
-            match segment.activity {
-                Activity::Work => Some(interval),
-                Activity::Break => {
-                    let covered = interval.duration().min(allowance);
-                    allowance -= covered;
-                    covered.is_positive().then(|| Interval {
-                        start: interval.start,
-                        end: interval.start + covered,
-                    })
+        let mut spans: Vec<Interval> = self
+            .segments
+            .iter()
+            .map(|segment| {
+                let interval = segment.interval(now);
+                match segment.activity {
+                    Activity::Work => interval,
+                    Activity::Break => {
+                        let covered = interval.duration().min(allowance);
+                        allowance -= covered;
+                        Interval {
+                            start: interval.start,
+                            end: interval.start + covered,
+                        }
+                    }
                 }
+            })
+            .filter(|span| span.duration().is_positive())
+            .collect();
+
+        let mut trim = (-self.adjustment).max(SignedDuration::ZERO);
+        while trim.is_positive()
+            && let Some(last) = spans.last_mut()
+        {
+            let duration = last.duration();
+            if duration > trim {
+                last.end -= trim;
+                break;
             }
-        })
+            trim -= duration;
+            spans.pop();
+        }
+        spans
     }
 
     fn running(&self) -> Result<Activity, SessionError> {
@@ -274,6 +306,55 @@ impl Session {
             start,
             end: None,
         });
+    }
+}
+
+/// A session as stored, before its invariants are checked.
+#[derive(Deserialize)]
+struct RawSession {
+    id: SessionId,
+    tag: TagId,
+    day: Date,
+    breaks: Option<BreakPolicy>,
+    segments: Vec<Segment>,
+    adjustment: SignedDuration,
+    stopped: bool,
+}
+
+impl TryFrom<RawSession> for Session {
+    type Error = SessionError;
+
+    fn try_from(raw: RawSession) -> Result<Self, Self::Error> {
+        let invalid = |reason| Err(SessionError::Invalid(reason));
+        let mut previous_end = None;
+        for (index, segment) in raw.segments.iter().enumerate() {
+            let is_last = index + 1 == raw.segments.len();
+            if segment.activity == Activity::Break && raw.breaks.is_none() {
+                return invalid("break segment without a break policy");
+            }
+            if previous_end.is_some_and(|end| segment.start < end) {
+                return invalid("segments overlap or are out of order");
+            }
+            match segment.end {
+                None if !is_last || raw.stopped => {
+                    return invalid("only the last segment of an open session can be running");
+                }
+                Some(end) if end < segment.start => {
+                    return invalid("segment ends before it starts");
+                }
+                _ => {}
+            }
+            previous_end = segment.end;
+        }
+        Ok(Self {
+            id: raw.id,
+            tag: raw.tag,
+            day: raw.day,
+            breaks: raw.breaks,
+            segments: raw.segments,
+            adjustment: raw.adjustment,
+            stopped: raw.stopped,
+        })
     }
 }
 
@@ -391,9 +472,8 @@ mod tests {
         session.start_break(at(10)).unwrap(); // 2 min earned
         session.stop(at(15)).unwrap();
 
-        let counted: Vec<_> = session.counted(at(15)).collect();
         assert_eq!(
-            counted,
+            session.counted(at(15)),
             [
                 Interval {
                     start: at(0),
@@ -421,5 +501,86 @@ mod tests {
         let session = Session::manual(TagId::generate(), day, MIN * 90).unwrap();
         assert_eq!(session.status(), Status::Stopped);
         assert_eq!(session.logged(at(0)), MIN * 90);
+    }
+
+    #[test]
+    fn an_edit_survives_the_clock_jumping_backwards() {
+        let mut session = started(None);
+        session.set_logged(SignedDuration::ZERO, at(60)).unwrap();
+        session.stop(at(59)).unwrap();
+        assert_eq!(session.logged(at(59)), SignedDuration::ZERO);
+    }
+
+    #[test]
+    fn earned_break_covers_breaks_in_order() {
+        let mut session = started(Some(BreakPolicy::default()));
+        session.start_break(at(50)).unwrap(); // 10 min earned
+        session.end_break(at(60)).unwrap();
+        session.start_break(at(60)).unwrap();
+        session.stop(at(65)).unwrap();
+
+        assert_eq!(session.logged(at(65)), MIN * 60);
+        assert_eq!(
+            session.counted(at(65)).last(),
+            Some(&Interval {
+                start: at(50),
+                end: at(60)
+            })
+        );
+    }
+
+    #[test]
+    fn lowering_elapsed_time_trims_counted_time_from_the_end() {
+        let mut session = started(None);
+        session.pause(at(30)).unwrap();
+        session.resume(at(40)).unwrap();
+        session.stop(at(60)).unwrap();
+        session.set_logged(MIN * 20, at(60)).unwrap();
+
+        assert_eq!(
+            session.counted(at(60)),
+            [Interval {
+                start: at(0),
+                end: at(20)
+            }]
+        );
+    }
+
+    #[test]
+    fn sessions_round_trip_through_serde() {
+        let mut session = started(Some(BreakPolicy::default()));
+        session.start_break(at(30)).unwrap();
+        let json = serde_json::to_string(&session).unwrap();
+        assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), session);
+    }
+
+    #[test]
+    fn deserializing_rejects_sessions_the_rules_do_not_allow() {
+        let mut session = started(Some(BreakPolicy::default()));
+        session.start_break(at(30)).unwrap();
+        session.end_break(at(35)).unwrap();
+        let valid = serde_json::to_value(&session).unwrap();
+
+        let corrupt = |edit: fn(&mut serde_json::Value)| {
+            let mut json = valid.clone();
+            edit(&mut json);
+            serde_json::from_value::<Session>(json).is_err()
+        };
+        assert!(
+            corrupt(|j| j["stopped"] = true.into()),
+            "stopped but running"
+        );
+        assert!(
+            corrupt(|j| j["segments"][0]["end"] = None::<()>.into()),
+            "open in the middle"
+        );
+        assert!(
+            corrupt(|j| j["breaks"] = None::<()>.into()),
+            "break without policy"
+        );
+        assert!(
+            corrupt(|j| j["segments"].as_array_mut().unwrap().reverse()),
+            "out of order"
+        );
     }
 }

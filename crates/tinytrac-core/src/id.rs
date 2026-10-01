@@ -18,6 +18,7 @@ macro_rules! id_type {
                 Self(Uuid::now_v7())
             }
 
+            /// The underlying UUID, for storage.
             pub fn as_uuid(&self) -> Uuid {
                 self.0
             }

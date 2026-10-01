@@ -57,7 +57,7 @@ impl DateRange {
 
     /// The range as a span of time in `tz`, from the first day's midnight to
     /// the midnight after the last day.
-    fn interval(self, tz: &TimeZone) -> Interval {
+    pub fn bounds(self, tz: &TimeZone) -> Interval {
         Interval {
             start: midnight(self.first, tz),
             end: midnight(self.last + 1.day(), tz),
@@ -74,24 +74,30 @@ pub struct Totals {
 impl Totals {
     /// Sums the logged time of `sessions` that falls within `range`.
     ///
-    /// Recorded time is split at midnight in `tz`, so a session running past
-    /// midnight counts towards both days. Adjustments have no position in time
-    /// and count towards the session's own day.
+    /// Pass every session whose segments overlap the range's
+    /// [`bounds`](DateRange::bounds) or whose `day` is in the range; others are
+    /// ignored anyway.
+    ///
+    /// Counted time is split at midnight in `tz`, so a session running past
+    /// midnight counts towards both days. A positive adjustment has no position
+    /// in time and counts towards the session's own day; a negative one is
+    /// already trimmed from the counted time, so no day goes below zero.
     pub fn compute<'a>(
         sessions: impl IntoIterator<Item = &'a Session>,
         range: DateRange,
         tz: &TimeZone,
         now: Timestamp,
     ) -> Self {
-        let bounds = range.interval(tz);
+        let bounds = range.bounds(tz);
         let mut totals = Self::default();
         for session in sessions {
-            for interval in session.counted(now).filter_map(|i| i.intersect(&bounds)) {
+            let counted = session.counted(now);
+            for interval in counted.iter().filter_map(|i| i.intersect(&bounds)) {
                 for (date, duration) in split_by_day(interval, tz) {
                     totals.add(date, session.tag, duration);
                 }
             }
-            if range.contains(session.day) && !session.adjustment().is_zero() {
+            if range.contains(session.day) && session.adjustment().is_positive() {
                 totals.add(session.day, session.tag, session.adjustment());
             }
         }
@@ -122,6 +128,10 @@ impl Totals {
 }
 
 /// Cuts `interval` at each midnight in `tz`, yielding each day's share.
+///
+/// Days are treated as contiguous spans from one midnight to the next. Where
+/// clocks fall back across midnight, the repeated hour counts towards the
+/// later day.
 fn split_by_day(interval: Interval, tz: &TimeZone) -> impl Iterator<Item = (Date, SignedDuration)> {
     let mut cursor = interval.start;
     std::iter::from_fn(move || {
@@ -151,6 +161,8 @@ mod tests {
     use crate::BreakPolicy;
 
     const MIN: SignedDuration = SignedDuration::from_mins(1);
+    /// Every session in these tests is stopped, so the current time doesn't matter.
+    const NOW: Timestamp = Timestamp::UNIX_EPOCH;
 
     fn warsaw() -> TimeZone {
         TimeZone::get("Europe/Warsaw").unwrap()
@@ -184,7 +196,7 @@ mod tests {
         session.stop(zoned("2026-10-02T01:30").timestamp()).unwrap();
 
         let range = DateRange::new(date(2026, 10, 1), date(2026, 10, 2));
-        let totals = Totals::compute([&session], range, &warsaw(), Timestamp::now());
+        let totals = Totals::compute([&session], range, &warsaw(), NOW);
         let days: Vec<_> = totals.days().map(|(day, tags)| (day, tags[&tag])).collect();
         assert_eq!(
             days,
@@ -202,7 +214,7 @@ mod tests {
             [&session],
             DateRange::day(date(2026, 10, 2)),
             &warsaw(),
-            Timestamp::now(),
+            NOW,
         );
         assert_eq!(totals.total(), MIN * 90);
     }
@@ -217,7 +229,7 @@ mod tests {
             [&session],
             DateRange::day(date(2026, 10, 25)),
             &warsaw(),
-            Timestamp::now(),
+            NOW,
         );
         assert_eq!(totals.total(), SignedDuration::from_hours(25));
     }
@@ -236,12 +248,26 @@ mod tests {
             [&tracked, &manual],
             DateRange::month_of(date(2026, 10, 1)),
             &warsaw(),
-            Timestamp::now(),
+            NOW,
         );
         assert_eq!(
             totals.by_tag(),
             BTreeMap::from([(a, MIN * 45), (b, MIN * 30)])
         );
         assert_eq!(totals.total(), MIN * 75);
+    }
+
+    #[test]
+    fn shortening_a_session_across_midnight_keeps_both_days_positive() {
+        let tag = TagId::generate();
+        let mut session = Session::start(tag, None, &zoned("2026-10-01T23:00"));
+        let stop = zoned("2026-10-02T01:00").timestamp();
+        session.stop(stop).unwrap();
+        session.set_logged(MIN * 30, stop).unwrap();
+
+        let range = DateRange::new(date(2026, 10, 1), date(2026, 10, 2));
+        let totals = Totals::compute([&session], range, &warsaw(), NOW);
+        let days: Vec<_> = totals.days().map(|(day, tags)| (day, tags[&tag])).collect();
+        assert_eq!(days, [(date(2026, 10, 1), MIN * 30)]);
     }
 }
