@@ -12,6 +12,7 @@ pub const HISTORY_DAYS: i64 = 14;
 pub struct Data {
     pub now: Zoned,
     pub settings: Settings,
+    pub sync_folder: String,
     /// All tags, archived ones included, sorted by name.
     pub tags: Vec<Tag>,
     /// The open timers.
@@ -26,6 +27,9 @@ impl Data {
         let now = engine.now();
         Ok(Self {
             settings: engine.settings()?,
+            sync_folder: engine
+                .sync_folder()?
+                .map_or_else(String::new, |path| path.display().to_string()),
             tags: engine.tags()?,
             timers: engine.timers()?.iter().cloned().collect(),
             recent: engine.sessions(recent_range(now.date()))?,

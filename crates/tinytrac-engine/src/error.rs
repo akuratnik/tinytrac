@@ -4,6 +4,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("file I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid sync data: {0}")]
+    Sync(String),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("stored data is unreadable: {0}")]

@@ -4,14 +4,19 @@
 //! derived from them. Every write also appends a revision to `changes`, which is
 //! what sync exchanges between devices.
 
+use std::{fmt, str::FromStr};
+
 use rusqlite::{Connection, OptionalExtension, Params, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tinytrac_core::{DateRange, Session, Status, Tag, TimeZone, Timestamp};
 use uuid::Uuid;
 
 use crate::{Error, Result, Settings};
 
-const MIGRATIONS: &[&str] = &[include_str!("migrations/001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/001_initial.sql"),
+    include_str!("migrations/002_sync.sql"),
+];
 
 /// Brings the schema up to date, tracking progress in `user_version`. Refuses a
 /// database written by a newer version, which this one might damage.
@@ -47,9 +52,46 @@ pub(crate) fn device_id(db: &Connection) -> Result<String> {
     Ok(id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Kind {
+    Tag,
+    Session,
+    Settings,
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Tag => "tag",
+            Self::Session => "session",
+            Self::Settings => "settings",
+        })
+    }
+}
+
+impl FromStr for Kind {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "tag" => Ok(Self::Tag),
+            "session" => Ok(Self::Session),
+            "settings" => Ok(Self::Settings),
+            _ => Err(Error::Sync(format!("unknown kind: {value}"))),
+        }
+    }
+}
+
+impl rusqlite::ToSql for Kind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.to_string().into())
+    }
+}
+
 /// A kind of record kept in the `records` table.
 pub(crate) trait Stored: Serialize + DeserializeOwned {
-    const KIND: &'static str;
+    const KIND: Kind;
 
     fn key(&self) -> String;
 
@@ -68,7 +110,7 @@ pub(crate) struct Index {
 }
 
 impl Stored for Tag {
-    const KIND: &'static str = "tag";
+    const KIND: Kind = Kind::Tag;
 
     fn key(&self) -> String {
         self.id.to_string()
@@ -76,7 +118,7 @@ impl Stored for Tag {
 }
 
 impl Stored for Session {
-    const KIND: &'static str = "session";
+    const KIND: Kind = Kind::Session;
 
     fn key(&self) -> String {
         self.id.to_string()
@@ -100,7 +142,7 @@ impl Stored for Session {
 pub(crate) const SETTINGS: &str = "settings";
 
 impl Stored for Settings {
-    const KIND: &'static str = "settings";
+    const KIND: Kind = Kind::Settings;
 
     fn key(&self) -> String {
         SETTINGS.to_owned()
@@ -171,38 +213,32 @@ impl<'a> Store<'a> {
     }
 
     /// Writes a new revision of a record and logs it in `changes`.
-    fn write(&self, kind: &str, key: &str, body: Option<&str>, index: &Index) -> Result<()> {
+    fn write(&self, kind: Kind, key: &str, body: Option<&str>, index: &Index) -> Result<()> {
         let parent: Option<String> = self
             .db
             .prepare_cached("SELECT rev FROM records WHERE id = ?1")?
             .query_row([key], |row| row.get(0))
             .optional()?;
-        let rev = Uuid::now_v7().to_string();
+        let latest: Option<String> = self.db.query_row(
+            "SELECT max(rev) FROM changes WHERE device = ?1",
+            [self.device],
+            |row| row.get(0),
+        )?;
+        let rev = next_revision(Uuid::now_v7(), latest.as_deref())?;
+        let merges = self
+            .db
+            .prepare_cached("SELECT rev FROM conflicts WHERE record = ?1 ORDER BY rev")?
+            .query_map([key], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let merges = serde_json::to_string(&merges)?;
         self.db
             .prepare_cached(
-                "INSERT INTO changes (rev, record, kind, parent, device, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO changes (rev, record, kind, parent, device, body, merges)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
-            .execute(params![rev, key, kind, parent, self.device, body])?;
-        self.db
-            .prepare_cached(
-                "INSERT INTO records (id, kind, rev, body, day, span_start, span_end, is_open)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT (id) DO UPDATE SET
-                    rev = excluded.rev, body = excluded.body, day = excluded.day,
-                    span_start = excluded.span_start, span_end = excluded.span_end,
-                    is_open = excluded.is_open",
-            )?
-            .execute(params![
-                key,
-                kind,
-                rev,
-                body,
-                index.day,
-                index.span_start,
-                index.span_end,
-                index.is_open
-            ])?;
+            .execute(params![rev, key, kind, parent, self.device, body, merges])?;
+        replace(self.db, kind, key, &rev, body, index)?;
+        crate::sync::merge(self.db, key)?;
         Ok(())
     }
 
@@ -216,6 +252,52 @@ impl<'a> Store<'a> {
     }
 }
 
+pub(crate) fn replace(
+    db: &Connection,
+    kind: Kind,
+    key: &str,
+    rev: &str,
+    body: Option<&str>,
+    index: &Index,
+) -> Result<()> {
+    db.prepare_cached(
+        "INSERT INTO records (id, kind, rev, body, day, span_start, span_end, is_open)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (id) DO UPDATE SET
+                    rev = excluded.rev, body = excluded.body, day = excluded.day,
+                    span_start = excluded.span_start, span_end = excluded.span_end,
+                    is_open = excluded.is_open",
+    )?
+    .execute(params![
+        key,
+        kind,
+        rev,
+        body,
+        index.day,
+        index.span_start,
+        index.span_end,
+        index.is_open
+    ])?;
+    Ok(())
+}
+
+/// Advance the timestamp if the wall clock stepped back, preserving `UUIDv7` bits.
+fn next_revision(candidate: Uuid, latest: Option<&str>) -> Result<String> {
+    let Some(latest) = latest.filter(|latest| *latest >= candidate.to_string().as_str()) else {
+        return Ok(candidate.to_string());
+    };
+    let previous = Uuid::parse_str(latest).map_err(|e| Error::Sync(e.to_string()))?;
+    let mut timestamp = [0; 8];
+    timestamp[2..].copy_from_slice(&previous.as_bytes()[..6]);
+    let next = u64::from_be_bytes(timestamp) + 1;
+    if next >= 1 << 48 {
+        return Err(Error::Sync("revision timestamp exhausted".into()));
+    }
+    let mut bytes = *candidate.as_bytes();
+    bytes[..6].copy_from_slice(&next.to_be_bytes()[2..]);
+    Ok(Uuid::from_bytes(bytes).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +306,31 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         migrate(&mut db).unwrap();
         db
+    }
+
+    #[test]
+    fn revisions_advance_after_clock_rollback() {
+        let db = database();
+        let future = "ffffffff-ff00-7fff-bfff-ffffffffffff";
+        db.execute("INSERT INTO changes (rev, record, kind, device) VALUES (?1, 'old', 'tag', 'this-device')", [future]).unwrap();
+        for _ in 0..2 {
+            Store::new(&db, "this-device")
+                .put(&Tag::new("New").unwrap())
+                .unwrap();
+        }
+        let revisions = db
+            .prepare("SELECT rev FROM changes ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(revisions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            revisions
+                .iter()
+                .all(|rev| Uuid::parse_str(rev).unwrap().get_version_num() == 7)
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ tinytrac is a Cargo workspace with three crates, each depending only on the one 
 | Crate | Role | Status |
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
-| `tinytrac-engine` | SQLite storage, commands, queries; folder sync next. | done |
+| `tinytrac-engine` | SQLite storage, commands, queries and folder sync. | done |
 | `tinytrac` | Desktop app ([iced](https://iced.rs)) with system tray. | done |
 
 The rules live in `core`, where they are tested without a database or a window.
@@ -121,23 +121,66 @@ UI tests (`src/app/tests.rs`) use `iced_test` to drive the real `view` and `upda
 headlessly: they click buttons by label and check what is on screen. Setting
 `TINYTRAC_SNAPSHOTS=<dir>` also saves a PNG of each screen.
 
-## Sync (planned)
+## Sync
 
-- Sync writes each change as an immutable file to a shared folder and imports
-  the other devices' files. No file is ever written by two devices, so file-sync
-  tools such as Syncthing never produce conflicting copies.
-- Records are merged whole, using parent revisions to tell successive edits from
-  concurrent ones. Concurrent edits get a deterministic winner, and the other
-  version is kept and flagged.
-- Sync transports sit behind a small trait, so a server backend can be added later.
-- The database itself never lives in the synced folder; file-sync tools and
-  SQLite's write-ahead log don't mix.
-- Imports keep the incoming revision ids and parents (unlike local writes, which
-  mint new ones), validate each body before writing it, and check that a record
-  never changes kind. Duplicate open timers can only arrive through imports,
-  where they will be resolved.
-- The device id must survive copying a database to another machine, so that two
-  devices never write as one.
+Each device has its own database and a persistent device id. Configure a shared
+folder in Settings; Syncthing replicates that folder between devices. Its path is
+local metadata, never part of the synced settings record. The engine resolves
+paths and refuses a folder containing its database, including through symlinks.
+Create a fresh database on each device: copying a database also copies its device
+id and must not be used to provision another writer.
+
+`transport.rs` defines three operations: publish, list, and read batches. Its only
+implementation is the folder. Merge and validation live in `sync.rs`, independent
+of the transport. Files are `<device>/<last-seq:020>-<uuidv7>.json`, containing format
+version 1 and an array of changes. Publication writes and fsyncs a temporary file
+in the same directory, renames it, and on Unix fsyncs the directories. Unique names
+allow sequence reuse after backup restore. The export transaction holds the writer lock
+until publication succeeds, then marks only its selected local changes exported.
+A crash before commit can republish revisions; revision ids make this harmless.
+Files are immutable and only a device's own changes are exported. Export errors
+are reported without preventing imports.
+
+Imports remember individual filenames in `imported_files`, allowing late arrivals.
+Non-JSON filenames are ignored. A bad file or change is reported without blocking
+other imports. Each file uses one transaction with a savepoint per change, so a
+validation failure rolls back only that change. Applied, known and permanently
+rejected changes all count toward marking the immutable file imported; rejection
+notices appear once. Invalid JSON is permanent except for unexpected EOF, which
+may mean a partial copy. Read failures, truncated files and database failures are
+retried. Counts and notices are published only after the transaction commits.
+Imports preserve each revision, parent, merge references and device.
+Bodies deserialize through core invariants, ids must match, and record kinds
+cannot change, even after deletion. Revisions must be canonical UUIDv7 strings.
+
+A record's heads are revisions that no known revision of that record names as its
+parent or in its `merges` array. A local edit names the winner as parent and all
+other current heads as merges, superseding them together. The greatest head by UUID string wins; ancestry takes precedence over
+wall-clock time. Recompute after imports and local writes, updating the body and
+lookup columns when the winner changes. This converges for the same revision
+history regardless of delivery order. Tombstones participate in the same rule.
+`conflicts` contains each current losing head, rebuilt for the affected record,
+so late ancestors do not leave false conflict warnings. The original losing
+bodies remain in `changes`.
+
+This is whole-record merging: concurrent edits to different fields can overwrite
+each other. UUID time reflects device clocks, so clock skew can favor an unexpected
+winner. Local revision ids advance beyond the greatest revision stored for that
+device even if its clock steps backward. Editing a conflicted record resolves all
+known branches; an unseen concurrent branch can still produce another notice.
+There is no dedicated conflict picker, history pruning, encryption or untrusted
+peer authentication. Keep the folder private and retain its batches for new
+installations. Duplicate open timers are settled by `Timers::load` and persisted
+by the next timer command, rather than during import.
+
+The app syncs after saved commands and on its 30-second refresh, then reloads data
+and report caches. Settings shows the last result/error and current conflict count.
+Folder I/O is synchronous; a slow or unavailable filesystem can delay the UI.
+Batches and revision histories have no size limit and are loaded into memory;
+merge work grows with the affected record's history. Device identity and revision
+monotonicity use the local database: restoring it cannot recover unseen edits or
+the revision high-water mark beyond the backup. Never run two writers with a
+copied device identity.
 
 ## Testing
 

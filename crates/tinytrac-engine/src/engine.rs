@@ -1,7 +1,10 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use jiff::{SignedDuration, Zoned, civil::Date};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use tinytrac_core::{DateRange, Session, SessionId, StartMode, Status, Tag, TagId, Timers, Totals};
 
 use crate::{
@@ -210,6 +213,62 @@ impl Engine {
             store.put(&settings)?;
             Ok(settings)
         })
+    }
+
+    /// The folder is local to this database; it is never part of synced settings.
+    pub fn sync_folder(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'sync_folder'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(PathBuf::from))
+    }
+
+    pub fn set_sync_folder(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        std::fs::create_dir_all(path.as_ref())?;
+        let path = std::fs::canonicalize(path)?;
+        self.check_sync_folder(&path)?;
+        let value = path
+            .to_str()
+            .ok_or_else(|| Error::Sync("sync folder must be UTF-8".into()))?;
+        self.db.execute("INSERT INTO meta (key, value) VALUES ('sync_folder', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [value])?;
+        Ok(())
+    }
+
+    pub fn clear_sync_folder(&mut self) -> Result<()> {
+        self.db
+            .execute("DELETE FROM meta WHERE key = 'sync_folder'", [])?;
+        Ok(())
+    }
+
+    /// Publishes local changes before importing other devices' immutable batches.
+    pub fn sync(&mut self) -> Result<crate::SyncReport> {
+        let Some(root) = self.sync_folder()? else {
+            return Ok(crate::SyncReport::default());
+        };
+        let root = std::fs::canonicalize(root)?;
+        self.check_sync_folder(&root)?;
+        let folder = crate::transport::Folder {
+            root,
+            device: self.device.clone(),
+        };
+        crate::sync::run(&mut self.db, &self.device, &folder)
+    }
+
+    fn check_sync_folder(&self, folder: &Path) -> Result<()> {
+        if let Some(path) = self.db.path().filter(|path| !path.is_empty()) {
+            let database = std::fs::canonicalize(path)?;
+            if database.starts_with(folder) {
+                return Err(Error::Sync(
+                    "sync folder must not contain the database".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     // Helpers

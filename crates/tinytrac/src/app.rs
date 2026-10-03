@@ -3,7 +3,7 @@
 
 mod lifecycle;
 
-use std::{path::Path, time::Duration};
+use std::{fmt::Write, path::Path, time::Duration};
 
 use iced::{
     Alignment::Center,
@@ -55,6 +55,7 @@ pub struct App {
     screen: Screen,
     modifiers: keyboard::Modifiers,
     error: Option<String>,
+    sync_status: String,
     timers: timers::State,
     history: history::State,
     reports: reports::State,
@@ -76,6 +77,7 @@ impl App {
             screen: Screen::Track,
             modifiers: keyboard::Modifiers::default(),
             error: None,
+            sync_status: String::new(),
             timers: timers::State::default(),
             history: history::State::default(),
         })
@@ -129,6 +131,43 @@ impl App {
 
     /// Reloads the data, e.g. after a command or to pick up changes made elsewhere.
     fn refresh(&mut self) {
+        self.sync_status = match self.engine.sync() {
+            Ok(report) => {
+                let mut status = if self.engine.sync_folder().ok().flatten().is_none() {
+                    "Sync disabled".to_owned()
+                } else {
+                    format!(
+                        "{}: {} exported, {} imported",
+                        self.engine.now().time().strftime("%H:%M:%S"),
+                        report.exported,
+                        report.imported
+                    )
+                };
+                if let Some(issue) = report.skipped.last() {
+                    let _ = write!(
+                        status,
+                        "; {} skipped: {}: {}",
+                        report.skipped.len(),
+                        issue.file.as_deref().unwrap_or("sync"),
+                        issue.reason
+                    );
+                }
+                if report.conflicts > 0 {
+                    let _ = write!(
+                        status,
+                        "; {} {} made on two devices at once; the newer one was kept.",
+                        report.conflicts,
+                        if report.conflicts == 1 {
+                            "edit"
+                        } else {
+                            "edits"
+                        }
+                    );
+                }
+                status
+            }
+            Err(error) => format!("{}: {error}", self.engine.now().time().strftime("%H:%M:%S")),
+        };
         let reloaded = Data::load(&self.engine).and_then(|data| {
             self.data = data;
             if let Some(tray) = &mut self.tray
@@ -181,7 +220,10 @@ impl App {
             .spacing(28)
             .into(),
             Screen::Reports => self.reports.view(&self.data).map(Message::Reports),
-            Screen::Settings => self.settings.view(&self.data).map(Message::Settings),
+            Screen::Settings => self
+                .settings
+                .view(&self.data, &self.sync_status)
+                .map(Message::Settings),
         };
 
         let mut page = column![header].spacing(12).padding(16);

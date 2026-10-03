@@ -13,3 +13,7 @@ mod store;
 pub use engine::{Engine, SessionEdit};
 pub use error::{Error, Result};
 pub use settings::{Settings, WeekStart};
+
+mod sync;
+mod transport;
+pub use sync::{SyncIssue, SyncReport};

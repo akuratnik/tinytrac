@@ -20,6 +20,7 @@ use crate::{
 /// otherwise shows the saved names.
 #[derive(Debug, Default)]
 pub struct State {
+    sync_folder: String,
     break_minutes: String,
     work_minutes: String,
     tag_names: BTreeMap<TagId, String>,
@@ -27,6 +28,8 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    SyncFolder(String),
+    SaveSyncFolder,
     BreakBank(bool),
     BreakMinutes(String),
     WorkMinutes(String),
@@ -41,6 +44,7 @@ impl State {
     pub fn new(data: &Data) -> Self {
         let policy = data.settings.break_policy;
         Self {
+            sync_folder: data.sync_folder.clone(),
             break_minutes: policy.break_minutes.to_string(),
             work_minutes: policy.work_minutes.to_string(),
             tag_names: BTreeMap::new(),
@@ -49,6 +53,17 @@ impl State {
 
     pub fn update(&mut self, message: Message, engine: &mut Engine) -> Result {
         match message {
+            Message::SyncFolder(folder) => {
+                self.sync_folder = folder;
+                return Ok(Outcome::Edited);
+            }
+            Message::SaveSyncFolder => {
+                if self.sync_folder.trim().is_empty() {
+                    engine.clear_sync_folder()?;
+                } else {
+                    engine.set_sync_folder(self.sync_folder.trim())?;
+                }
+            }
             Message::BreakBank(on) => {
                 // Turning the bank on uses the ratio in the fields, saved or not.
                 let policy = if on { Some(self.policy()?) } else { None };
@@ -102,7 +117,7 @@ impl State {
         ))
     }
 
-    pub fn view<'a>(&'a self, data: &'a Data) -> Element<'a, Message> {
+    pub fn view<'a>(&'a self, data: &'a Data, sync_status: &'a str) -> Element<'a, Message> {
         let settings = data.settings;
         let break_bank = column![
             toggler(settings.break_bank)
@@ -161,6 +176,17 @@ impl State {
             heading("Settings"),
             break_bank,
             week_start,
+            text("Sync folder"),
+            row![
+                text_input("Folder path (empty disables sync)", &self.sync_folder)
+                    .on_input(Message::SyncFolder)
+                    .on_submit(Message::SaveSyncFolder),
+                button("Save folder")
+                    .style(button::secondary)
+                    .on_press(Message::SaveSyncFolder),
+            ]
+            .spacing(6),
+            muted(sync_status),
             heading("Tags"),
             muted("Press Enter to rename. Archived tags keep their history."),
             column(tags).spacing(6),
