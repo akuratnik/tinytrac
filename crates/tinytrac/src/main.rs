@@ -4,6 +4,7 @@ mod app;
 mod data;
 mod duration;
 mod screen;
+mod tray;
 
 use std::path::PathBuf;
 
@@ -11,10 +12,9 @@ use app::App;
 
 fn main() -> iced::Result {
     let path = database_path();
-    iced::application(move || App::boot(&path), App::update, App::view)
-        .title("tinytrac")
+    iced::daemon(move || App::boot(&path), App::update, App::view)
+        .title(|_: &App, _| "tinytrac".to_owned())
         .subscription(App::subscription)
-        .window_size((460.0, 720.0))
         .run()
 }
 

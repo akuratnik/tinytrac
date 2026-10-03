@@ -19,3 +19,10 @@ iced_test.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { workspace = true, features = ["ksni"] }
+zbus.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = { workspace = true, features = ["default"] }

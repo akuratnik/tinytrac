@@ -38,17 +38,21 @@ impl Harness {
             .checked_add(SignedDuration::from_mins(1) * minutes)
             .unwrap();
         drop(now);
-        self.app.update(Message::Tick);
+        let _ = self.app.update(Message::Tick);
     }
 
     fn send(&mut self, message: Message) {
-        self.app.update(message);
+        let _ = self.app.update(message);
         assert_eq!(self.app.error, None);
     }
 
     /// The UI at the window's real size.
     fn ui(&self) -> Simulator<'_, Message> {
-        Simulator::with_size(iced::Settings::default(), (460.0, 720.0), self.app.view())
+        Simulator::with_size(
+            iced::Settings::default(),
+            (460.0, 720.0),
+            self.app.view(iced::window::Id::unique()),
+        )
     }
 
     /// Clicks the first widget showing `label`, then applies its messages.
@@ -144,9 +148,10 @@ fn invalid_input_is_reported_not_saved() {
     let mut h = Harness::new();
     h.create_tag("Acme");
     h.click("Add time");
-    h.app
+    let _ = h
+        .app
         .update(Message::History(history::Message::Elapsed("soon".into())));
-    h.app.update(Message::History(history::Message::Save));
+    let _ = h.app.update(Message::History(history::Message::Save));
     assert!(h.app.error.is_some());
     assert!(h.shows("Today 0m"));
 }
@@ -214,14 +219,121 @@ fn an_error_stays_until_something_is_saved_or_it_is_dismissed() {
     h.create_tag("Acme");
     h.click("Add time");
     for elapsed in ["99999999999999999", "soon"] {
-        h.app
+        let _ = h
+            .app
             .update(Message::History(history::Message::Elapsed(elapsed.into())));
-        h.app.update(Message::History(history::Message::Save));
+        let _ = h.app.update(Message::History(history::Message::Save));
         assert!(h.app.error.is_some(), "{elapsed} is refused");
     }
-    h.app
+    let _ = h
+        .app
         .update(Message::History(history::Message::Elapsed("1:".into())));
     assert!(h.app.error.is_some(), "typing keeps the error");
     h.send(Message::DismissError);
     assert!(h.shows("Today 0m"));
+}
+
+#[test]
+fn pause_all_uses_the_same_save_and_reload_path() {
+    let mut h = Harness::new();
+    h.create_tag("Acme");
+    h.create_tag("Globex");
+    let tags: Vec<_> = h.app.data.tags.iter().map(|tag| tag.id).collect();
+    for tag in tags {
+        h.send(Message::Timers(timers::Message::Start(
+            tag,
+            tinytrac_core::StartMode::Alongside,
+        )));
+    }
+    h.advance(15);
+    h.send(Message::Timers(timers::Message::PauseAll));
+    assert!(!h.app.data.any_running());
+    assert!(h.shows("Today 30m"));
+}
+
+#[test]
+fn reopening_a_window_keeps_the_engine_and_forms() {
+    let mut h = Harness::new();
+    h.create_tag("Acme");
+    h.click("Start");
+    h.click("Add time");
+    h.send(Message::History(history::Message::Elapsed("12m".into())));
+    let _ = h.app.update(Message::ShowWindow);
+    let first = h.app.window.unwrap();
+    let _ = h.app.update(Message::ShowWindow);
+    assert_eq!(h.app.window, Some(first), "Show reuses an existing window");
+    // The close task is deliberately not executed by this headless harness.
+    let _ = h.app.update(Message::CloseWindow(first));
+    assert!(h.app.window.is_none());
+    let _ = h.app.update(Message::ShowWindow);
+    assert_ne!(h.app.window, Some(first));
+    assert!(h.app.data.any_running());
+    h.click("Save");
+    assert!(h.shows("Today 12m"), "the edit buffer survived");
+}
+
+#[test]
+fn losing_the_tray_host_restores_a_closed_window() {
+    let mut h = Harness::new();
+    assert!(h.app.window.is_none());
+    let _ = h.app.update(Message::TrayHost(false));
+    assert!(h.app.window.is_some());
+}
+
+#[test]
+fn tray_start_and_pause_all_use_screen_commands() {
+    let mut h = Harness::new();
+    h.create_tag("Acme");
+    let tag = h.app.data.tags[0].id;
+    h.app.tray = Some(crate::tray::Tray::headless(&h.app.data));
+    h.send(Message::TrayMenu(format!("start/{tag}")));
+    assert!(h.app.data.any_running());
+    assert!(h.shows("Stop"));
+    h.advance(15);
+    h.send(Message::TrayMenu("pause-all".into()));
+    assert!(!h.app.data.any_running());
+    assert!(h.shows("Today 15m"));
+    assert!(h.shows("Resume"));
+}
+
+#[test]
+fn tray_quit_exits_without_stopping_timers() {
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_test::runtime::{Action, task};
+
+    let mut h = Harness::new();
+    h.create_tag("Acme");
+    h.click("Start");
+    h.app.tray = Some(crate::tray::Tray::headless(&h.app.data));
+    let task = h.app.update(Message::TrayMenu("quit".into()));
+    let mut actions = task::into_stream(task).unwrap();
+    assert!(matches!(block_on(actions.next()), Some(Action::Exit)));
+    assert!(h.app.data.any_running());
+}
+
+#[test]
+fn closing_a_foreign_window_is_ignored() {
+    let mut h = Harness::new();
+    h.send(Message::ShowWindow);
+    let window = h.app.window;
+    h.send(Message::ModifiersChanged(Modifiers::COMMAND));
+    let task = h
+        .app
+        .update(Message::CloseWindow(iced::window::Id::unique()));
+    assert!(iced_test::runtime::task::into_stream(task).is_none());
+    assert_eq!(h.app.window, window);
+    assert_eq!(h.app.modifiers, Modifiers::COMMAND);
+}
+
+#[test]
+fn tray_ids_without_a_tray_are_ignored() {
+    let mut h = Harness::new();
+    h.create_tag("Acme");
+    let tag = h.app.data.tags[0].id;
+    for id in [format!("start/{tag}"), "quit".into(), "show".into()] {
+        let task = h.app.update(Message::TrayMenu(id));
+        assert!(iced_test::runtime::task::into_stream(task).is_none());
+    }
+    assert!(!h.app.data.any_running());
+    assert!(h.app.window.is_none());
 }

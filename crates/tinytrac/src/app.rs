@@ -1,12 +1,15 @@
 //! The top-level iced program: routes messages to screens and reloads the
 //! shared data after every command.
 
+mod lifecycle;
+
 use std::{path::Path, time::Duration};
 
 use iced::{
     Alignment::Center,
-    Element, Fill, Subscription, keyboard, time,
+    Element, Fill, Subscription, Task, keyboard, time,
     widget::{button, column, container, row, scrollable, text},
+    window,
 };
 use tinytrac_core::DateRange;
 use tinytrac_engine::Engine;
@@ -15,6 +18,7 @@ use crate::{
     data::Data,
     duration,
     screen::{self, Outcome, history, reports, settings, timers},
+    tray,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,11 @@ pub enum Screen {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    CloseWindow(window::Id),
+    ShowWindow,
+    Quit,
+    TrayMenu(String),
+    TrayHost(bool),
     Refresh,
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
@@ -39,6 +48,8 @@ pub enum Message {
 
 #[derive(Debug)]
 pub struct App {
+    window: Option<window::Id>,
+    tray: Option<tray::Tray>,
     engine: Engine,
     data: Data,
     screen: Screen,
@@ -56,6 +67,8 @@ impl App {
         let mut reports = reports::State::new(&data);
         reports.reload(&engine, &data)?;
         Ok(Self {
+            window: None,
+            tray: None,
             settings: settings::State::new(&data),
             reports,
             engine,
@@ -69,33 +82,25 @@ impl App {
     }
 
     /// Opens the database at `path`, exiting with a message if that fails.
-    pub fn boot(path: &Path) -> Self {
-        Engine::open(path)
+    pub fn boot(path: &Path) -> (Self, Task<Message>) {
+        let mut app = Engine::open(path)
             .map_err(screen::Error::from)
             .and_then(Self::new)
             .unwrap_or_else(|error| {
                 eprintln!("tinytrac: cannot open {}: {error}", path.display());
                 std::process::exit(1);
-            })
+            });
+        let task = app.open_window();
+        (app, task)
     }
 
-    pub fn update(&mut self, message: Message) {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         let outcome = match message {
-            Message::Tick => return self.tick(),
-            Message::Refresh => return self.refresh(),
-            Message::Show(screen) => return self.show(screen),
-            Message::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers;
-                return;
-            }
-            Message::DismissError => {
-                self.error = None;
-                return;
-            }
             Message::Timers(message) => self.timers.update(message, &mut self.engine),
             Message::History(message) => self.history.update(message, &mut self.engine, &self.data),
             Message::Reports(message) => self.reports.update(message, &self.engine, &self.data),
             Message::Settings(message) => self.settings.update(message, &mut self.engine),
+            message => return self.lifecycle(message),
         };
         match outcome {
             Ok(Outcome::Edited) => {}
@@ -109,6 +114,7 @@ impl App {
                 self.refresh();
             }
         }
+        Task::none()
     }
 
     /// Moves the clock on; a new day also needs fresh data.
@@ -125,6 +131,11 @@ impl App {
     fn refresh(&mut self) {
         let reloaded = Data::load(&self.engine).and_then(|data| {
             self.data = data;
+            if let Some(tray) = &mut self.tray
+                && let Err(error) = tray.refresh(&self.data)
+            {
+                eprintln!("tinytrac: cannot update tray: {error}");
+            }
             self.reports.reload(&self.engine, &self.data)
         });
         if let Err(error) = reloaded {
@@ -139,7 +150,7 @@ impl App {
         self.screen = screen;
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub fn view(&self, _window: window::Id) -> Element<'_, Message> {
         let today = self.data.totals(DateRange::day(self.data.today())).total();
         let tab = |label, screen| {
             let style = if self.screen == screen {
@@ -205,7 +216,13 @@ impl App {
         let period = if self.data.any_running() { 1 } else { 60 };
         let tick = time::every(Duration::from_secs(period)).map(|_| Message::Tick);
         let refresh = time::every(Duration::from_secs(30)).map(|_| Message::Refresh);
-        Subscription::batch([modifiers, tick, refresh])
+        Subscription::batch([
+            modifiers,
+            tick,
+            refresh,
+            window::close_requests().map(Message::CloseWindow),
+            tray::subscription(),
+        ])
     }
 }
 

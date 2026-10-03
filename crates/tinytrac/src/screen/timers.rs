@@ -23,6 +23,7 @@ pub struct State {
 pub enum Message {
     Start(TagId, StartMode),
     Pause(TagId),
+    PauseAll,
     StartBreak(TagId),
     EndBreak(TagId),
     Stop(TagId),
@@ -35,6 +36,7 @@ impl State {
         match message {
             Message::Start(tag, mode) => _ = engine.start(tag, mode)?,
             Message::Pause(tag) => _ = engine.pause(tag)?,
+            Message::PauseAll => _ = engine.pause_all()?,
             Message::StartBreak(tag) => _ = engine.start_break(tag)?,
             Message::EndBreak(tag) => _ = engine.end_break(tag)?,
             Message::Stop(tag) => _ = engine.stop(tag)?,

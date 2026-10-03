@@ -6,7 +6,7 @@ tinytrac is a Cargo workspace with three crates, each depending only on the one 
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
 | `tinytrac-engine` | SQLite storage, commands, queries; folder sync next. | done |
-| `tinytrac` | Desktop app ([iced](https://iced.rs)); tray icon next. | done |
+| `tinytrac` | Desktop app ([iced](https://iced.rs)) with system tray. | done |
 
 The rules live in `core`, where they are tested without a database or a window.
 The UI is a thin layer over engine commands.
@@ -97,6 +97,25 @@ nothing runs), so they never touch the database. Forms remember the values they
 opened with and save only what the user changed. Start buttons carry their
 `StartMode`, decided from the modifier keys when the view is built: Ctrl+click
 (Cmd on macOS) starts a timer alongside the running one.
+
+The app runs as an `iced::daemon`: closing the window destroys it, keeping `App`
+and its engine alive when a tray is available. Show opens a new window or focuses
+an existing one; Quit exits without stopping the persisted timers. Without a tray,
+closing the window exits. `app/lifecycle.rs` handles window and tray lifecycle.
+Native tray resources are created in `update`, after the event loop has started
+(required on macOS), and stay on that thread.
+
+`tray.rs` adapts a pure menu model (`tray/model.rs`) to `tray-icon`. Menus and the
+today tooltip refresh with `Data`, not with clock ticks; the generated RGBA clock
+changes when running state changes. Native callbacks feed a channel subscription,
+delivering one iced message per event through the screens' command and reload
+paths. On Linux, the ksni backend uses D-Bus without a GTK loop. Since it assumes
+a tray host exists, a
+separate asynchronous subscription uses one D-Bus connection to check ownership
+of `org.kde.StatusNotifierWatcher`, then follows `NameOwnerChanged` for that name.
+It does not poll or use the host registration property, which hosts may hardcode.
+GNOME needs the AppIndicator extension. If the host disappears while the window
+is closed, the app reopens it so the user can still reach the app.
 
 UI tests (`src/app/tests.rs`) use `iced_test` to drive the real `view` and `update`
 headlessly: they click buttons by label and check what is on screen. Setting
