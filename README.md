@@ -17,13 +17,41 @@ A tiny, native time tracker for work. No browser engine or required account.
 
 Requires Rust 1.90 or newer. GNOME needs the AppIndicator extension for the tray; without it, closing the window exits.
 On GNOME, single-click opens the tray menu; double-click or **Show tinytrac** reopens the window.
-On macOS, reopen a closed window from the tray; the Dock icon does not reopen it.
+On macOS, reopen a closed window from the tray.
 
 ```sh
 cargo run --release            # data lives in ~/.local/share/tinytrac on Linux
 TINYTRAC_DB=/tmp/demo.db cargo run   # try it on a throwaway database
 cargo test                     # domain, storage and headless UI tests
 ```
+
+## macOS app
+
+On a Mac with Rust and Xcode Command Line Tools installed, run from the repo root:
+
+```sh
+scripts/bundle-macos.sh --sign "tinytrac" --zip
+# Add --universal to build for both Apple Silicon and Intel Macs.
+```
+
+For the signing identity, do this once in **Keychain Access → Certificate Assistant →
+Create a Certificate…**: name it **tinytrac**, choose **Self Signed Root** as the
+identity type and **Code Signing** as the certificate type. Keep using the same
+certificate for updates so Keychain can preserve the app's access to saved Google
+tokens. Omit `--sign` for ad-hoc signing; those builds may ask to allow Keychain
+access again after each update.
+
+The script reads `~/.config/tinytrac/google-client.json` (override with
+`TINYTRAC_GOOGLE_CLIENT`) using macOS's built-in `plutil`. Without that file it
+builds without Google sync. The minimum macOS version defaults to 13.0; override
+with `MACOSX_DEPLOYMENT_TARGET`. Universal builds require both Rust targets:
+`rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+
+Copy `target/bundle/tinytrac.app` to **/Applications** on each Mac, or transfer
+`target/bundle/tinytrac-<version>-macos.zip` and unzip it first. Open the app; if
+macOS blocks a quarantined copy, use **System Settings → Privacy & Security →
+Open Anyway**. Add it under **System Settings → General → Login Items** to start
+at login. The bundle runs in the menu bar without a Dock icon.
 
 ## Sync with Google Drive
 
