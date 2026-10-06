@@ -6,7 +6,7 @@ tinytrac is a Cargo workspace with four crates. The engine depends on core; Driv
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
 | `tinytrac-engine` | SQLite storage, commands, queries and transport-independent sync. | done |
-| `tinytrac-drive` | Blocking Google OAuth and Drive app-data transport. | done; app wiring next |
+| `tinytrac-drive` | Blocking Google OAuth and Drive app-data transport. | done |
 | `tinytrac` | Desktop app ([iced](https://iced.rs)) with system tray. | done |
 
 The rules live in `core`, where they are tested without a database or a window.
@@ -249,7 +249,7 @@ further settlement converge once the same history has arrived. A further exchang
 of a settled history creates no new revisions.
 
 The app requests sync at startup, after saved commands and every 30 seconds. At boot it opens
-one second `Engine` for file databases and retains it with an optional `Folder` transport cache in one worker
+one second `Engine` for file databases and retains it with an optional folder or Drive transport cache in one worker
 for the app's lifetime. An `Arc<Mutex<Worker>>` moves serialized work between
 threads; transport state survives runs and label changes, and is dropped when the
 target identity or epoch changes. A stale-context race returns an empty run without
@@ -265,7 +265,7 @@ Settings shows durable rejections and current conflicts only when nonzero, along
 the last run's timestamped status: Synced, Sync incomplete with skipped issues,
 or Sync failed with the error (or Sync disabled). When the latest run is not clean,
 the last successful sync time is shown separately if one is known. Remote targets
-show their display label; this step adds no remote setup UI. The main error banner
+show their signed-in account and local sign-out action. The main error banner
 appears when the rejected total grows or a new transient problem appears; whole-sync errors count as transient.
 The rejected baseline is seeded from the initial snapshot, so old rejections do
 not raise a banner on launch. Banners describe only new problems. Problem identity
@@ -292,8 +292,35 @@ beyond the backup. Never run two writers with a copied device identity.
 This blocking crate implements `Transport` on the sync worker thread. It owns one
 reused ureq Agent with rustls, a 10-second connect timeout and a 120-second overall
 request timeout, including response bodies. It has no async runtime or Google SDK.
-The app will supply a Desktop OAuth `Client`, launch the system browser, and store
-the refresh token in its keychain; settings and worker integration are a next step.
+The app supplies a Desktop OAuth `Client` from build-time environment variables.
+Without both values, Settings omits the Google Drive choice. The optional client
+and credential store are injectable in app state for network-free tests.
+
+`credentials.rs` exposes a small `Store` trait (load/save/delete by remote target
+id). Production uses keyring 3.6.3 with explicit platform features: `apple-native`
+on macOS, `async-secret-service`, `async-io`, and `crypto-rust` on Linux. The latter
+uses secret-service 4.0.0 and zbus 4.4.0, alongside the tray's zbus 5; it does not
+link libdbus. There is no plaintext or mock fallback on supported platforms.
+The service is `net.expertstudio.tinytrac`; accounts are `google-drive:<permission id>`.
+Tests inject an in-memory store.
+
+`app/google.rs` owns authorization generations and cancellation flags. The
+thread/oneshot helper runs OAuth off the UI thread. The browser launcher starts
+`open` or `xdg-open`; a separate thread reaps the child and reports launch failure
+without holding up callbacks or cancellation. Cancel, a replacement attempt, or a
+target selection invalidates the generation. Only a current completion can save
+the refresh token, then call `set_sync_target(Remote { id, label: email })`.
+A keychain save failure leaves the target unchanged. Local sign-out clears the
+target then deletes its keychain entry, without network revocation.
+
+The sync worker loads the token when building a Drive transport and retains that
+transport across runs. Missing credentials or `AuthRequired` pause requests and
+raise one problem banner; Settings offers sign-in again. Restart re-derives this
+state on the first run (a revoked token fails once). Successful sign-in invalidates
+the cache even for the same account and resumes sync. Worker completions carry a
+generation too, so an old authentication failure cannot expire a new sign-in.
+Folder, remote and Off choices all use the engine target setter, preserving its
+history republishing rules.
 
 `authorize` binds `127.0.0.1:0` before launching the browser. It uses a random
 32-byte PKCE verifier (S256), an independent random state, the `drive.appdata`

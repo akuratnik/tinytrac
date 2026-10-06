@@ -1,6 +1,7 @@
 //! The top-level iced program: routes messages to screens and reloads the
 //! shared data after every command.
 
+mod google;
 mod lifecycle;
 mod sync;
 
@@ -38,7 +39,11 @@ pub enum Message {
     TrayMenu(String),
     TrayHost(bool),
     Refresh,
+    #[cfg(test)]
     Synced(Result<SyncRun, sync::Failure>),
+    WorkerSynced(u64, Result<SyncRun, sync::Failure>),
+    BrowserFinished(u64, Result<(), sync::Failure>),
+    SignedIn(u64, Result<google::SignedIn, sync::Failure>),
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
     DismissError,
@@ -54,6 +59,7 @@ pub struct App {
     tray: Option<tray::Tray>,
     engine: Engine,
     sync: sync::State,
+    google: google::State,
     data: Data,
     screen: Screen,
     modifiers: keyboard::Modifiers,
@@ -77,6 +83,7 @@ impl App {
             reports,
             engine,
             sync,
+            google: google::State::default(),
             data,
             screen: Screen::Track,
             modifiers: keyboard::Modifiers::default(),
@@ -104,7 +111,18 @@ impl App {
             Message::Timers(message) => self.timers.update(message, &mut self.engine),
             Message::History(message) => self.history.update(message, &mut self.engine, &self.data),
             Message::Reports(message) => self.reports.update(message, &self.engine, &self.data),
-            Message::Settings(message) => self.settings.update(message, &mut self.engine),
+            Message::Settings(
+                message @ (settings::Message::SignIn
+                | settings::Message::CancelSignIn
+                | settings::Message::SignOut
+                | settings::Message::SyncMode(_)),
+            ) => return self.google_action(&message),
+            Message::Settings(message) => {
+                if matches!(message, settings::Message::SaveSyncFolder) {
+                    self.google.cancel();
+                }
+                self.settings.update(message, &mut self.engine)
+            }
             message => return self.lifecycle(message),
         };
         match outcome {
@@ -135,6 +153,18 @@ impl App {
     /// Reloads the data, e.g. after a command or to pick up changes made elsewhere.
     fn refresh(&mut self) {
         let reloaded = Data::load(&self.engine).and_then(|data| {
+            if self.data.sync_target != data.sync_target {
+                self.google.cancel();
+                let same_identity = self
+                    .data
+                    .sync_target
+                    .as_ref()
+                    .zip(data.sync_target.as_ref())
+                    .is_some_and(|(old, new)| old.same_identity(new));
+                if !same_identity {
+                    self.sync.invalidate();
+                }
+            }
             self.data = data;
             if let Some(tray) = &mut self.tray
                 && let Err(error) = tray.refresh(&self.data)
@@ -150,7 +180,11 @@ impl App {
 
     fn show(&mut self, screen: Screen) {
         if screen == Screen::Settings && self.screen != Screen::Settings {
+            let selected = self.settings.sync_mode;
             self.settings = settings::State::new(&self.data);
+            if self.data.sync_target.is_none() {
+                self.settings.sync_mode = selected;
+            }
         }
         self.screen = screen;
     }
@@ -188,7 +222,13 @@ impl App {
             Screen::Reports => self.reports.view(&self.data).map(Message::Reports),
             Screen::Settings => self
                 .settings
-                .view(&self.data, &self.sync.status)
+                .view(
+                    &self.data,
+                    &self.sync.status,
+                    self.sync.client.is_some(),
+                    self.google.waiting(),
+                    self.sync.auth_required,
+                )
                 .map(Message::Settings),
         };
 

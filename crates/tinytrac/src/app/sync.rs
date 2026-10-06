@@ -6,7 +6,7 @@ use std::{
 };
 
 use iced::Task;
-use tinytrac_engine::{Engine, Folder, SyncContext, SyncRun, Transport};
+use tinytrac_engine::{Engine, Folder, SyncContext, SyncRun, SyncTarget, Transport};
 
 use super::Message;
 use crate::{data::Data, screen};
@@ -44,6 +44,10 @@ pub(super) struct State {
     pub(super) problems: SyncProblems,
     pub(super) status: String,
     last_success: Option<String>,
+    pub(super) auth_required: bool,
+    generation: u64,
+    pub(super) client: Option<tinytrac_drive::Client>,
+    pub(super) credentials: Arc<dyn crate::credentials::Store>,
 }
 
 impl State {
@@ -53,6 +57,7 @@ impl State {
             Arc::new(Mutex::new(Worker {
                 engine,
                 transport: None,
+                generation: 0,
             }))
         });
         let problems = SyncProblems {
@@ -72,10 +77,17 @@ impl State {
             problems,
             status,
             last_success: None,
+            auth_required: false,
+            generation: 0,
+            client: super::google::client(),
+            credentials: Arc::new(crate::credentials::Keychain),
         })
     }
 
     pub(super) fn request(&mut self) -> Task<Message> {
+        if self.auth_required {
+            return Task::none();
+        }
         let Some(engine) = self.engine.clone() else {
             return Task::none();
         };
@@ -84,16 +96,41 @@ impl State {
             return Task::none();
         }
         self.syncing = true;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let credentials = self.credentials.clone();
         Task::perform(
             blocking(move || {
-                engine
+                let mut worker = engine
                     .lock()
-                    .map_err(|error| Failure::Other(error.to_string()))?
-                    .run()
+                    .map_err(|error| Failure::Other(error.to_string()))?;
+                if worker.generation != generation {
+                    worker.generation = generation;
+                    worker.transport = None;
+                }
+                worker
+                    .run(client, credentials.as_ref())
                     .map_err(Failure::from)
             }),
-            Message::Synced,
+            move |result| Message::WorkerSynced(generation, result),
         )
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.generation += 1;
+        self.auth_required = false;
+        self.problems.transient.clear();
+        self.last_success = None;
+        self.status = "Not synced yet".into();
+    }
+
+    pub(super) fn current(&mut self, generation: u64) -> bool {
+        if generation == self.generation {
+            return true;
+        }
+        self.syncing = false;
+        self.queued = false;
+        false
     }
 
     pub(super) fn finish(
@@ -103,6 +140,8 @@ impl State {
         now: &jiff::Zoned,
     ) -> (Option<String>, Task<Message>) {
         self.syncing = false;
+        self.auth_required = matches!(result, Err(Failure::AuthRequired(_)))
+            && matches!(data.sync_target, Some(SyncTarget::Remote { .. }));
         let mut problems = match result {
             Ok(run) => run
                 .skipped
@@ -184,17 +223,75 @@ impl SyncProblems {
 
 /// Retains transport caches between serialized runs, bound to one context.
 #[derive(Debug)]
-struct Worker<T = Folder> {
+struct Worker<T = Backend> {
     engine: Engine,
     transport: Option<T>,
+    generation: u64,
 }
 
+#[derive(Debug)]
+enum Backend {
+    Folder(Folder),
+    Drive(Box<tinytrac_drive::Drive>),
+}
+impl Transport for Backend {
+    fn context(&self) -> &SyncContext {
+        match self {
+            Self::Folder(t) => t.context(),
+            Self::Drive(t) => t.context(),
+        }
+    }
+    fn publish(&mut self, name: &str, bytes: &[u8]) -> tinytrac_engine::Result<()> {
+        match self {
+            Self::Folder(t) => t.publish(name, bytes),
+            Self::Drive(t) => t.publish(name, bytes),
+        }
+    }
+    fn list(&mut self) -> tinytrac_engine::Result<Vec<String>> {
+        match self {
+            Self::Folder(t) => t.list(),
+            Self::Drive(t) => t.list(),
+        }
+    }
+    fn read(&mut self, key: &str) -> tinytrac_engine::Result<Vec<u8>> {
+        match self {
+            Self::Folder(t) => t.read(key),
+            Self::Drive(t) => t.read(key),
+        }
+    }
+}
 impl Worker {
-    fn run(&mut self) -> tinytrac_engine::Result<SyncRun> {
+    fn run(
+        &mut self,
+        client: Option<tinytrac_drive::Client>,
+        credentials: &dyn crate::credentials::Store,
+    ) -> tinytrac_engine::Result<SyncRun> {
         self.run_with(|context| {
-            Folder::for_context(context).ok_or_else(|| {
-                tinytrac_engine::Error::Sync("remote transport is not available".into())
-            })
+            if let Some(folder) = Folder::for_context(context) {
+                return Ok(Backend::Folder(folder));
+            }
+            let SyncTarget::Remote { id, .. } = context.target() else {
+                unreachable!()
+            };
+            let client = client.ok_or_else(|| {
+                tinytrac_engine::Error::AuthRequired(
+                    "This build has no Google client credentials".into(),
+                )
+            })?;
+            let token = credentials
+                .load(id)
+                .map_err(tinytrac_engine::Error::AuthRequired)?
+                .ok_or_else(|| {
+                    tinytrac_engine::Error::AuthRequired(
+                        "Google sign-in expired; sign in again".into(),
+                    )
+                })?;
+            Ok(Backend::Drive(Box::new(tinytrac_drive::Drive::new(
+                client,
+                token,
+                context.clone(),
+                tinytrac_drive::Endpoints::default(),
+            ))))
         })
     }
 }
@@ -242,7 +339,7 @@ impl<T: Transport> Worker<T> {
     }
 }
 
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, Failure> + Send + 'static,
 ) -> Result<T, Failure> {
     let (sender, receiver) = iced::futures::channel::oneshot::channel();
@@ -289,6 +386,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_without_token_requires_auth_before_network() {
+        let mut engine = Engine::open_in_memory().unwrap();
+        engine
+            .set_sync_target(Some(SyncTarget::Remote {
+                id: "google-drive:missing".into(),
+                label: "Missing".into(),
+            }))
+            .unwrap();
+        let mut worker = Worker {
+            engine,
+            transport: None,
+            generation: 0,
+        };
+        let credentials = crate::credentials::Memory::default();
+        let client = tinytrac_drive::Client {
+            id: "test".into(),
+            secret: "test".into(),
+        };
+        assert!(matches!(
+            worker.run(Some(client), &credentials),
+            Err(tinytrac_engine::Error::AuthRequired(_))
+        ));
+        assert!(worker.transport.is_none());
+    }
+
+    #[test]
     fn worker_preserves_caches_until_identity_or_epoch_changes() {
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
         let build = |context: &SyncContext| {
@@ -301,6 +424,7 @@ mod tests {
         let mut worker = Worker {
             engine: Engine::open_in_memory().unwrap(),
             transport: None,
+            generation: 0,
         };
         let remote = |id: &str, label: &str| {
             Some(SyncTarget::Remote {
@@ -342,6 +466,7 @@ mod tests {
         let mut worker = Worker {
             engine,
             transport: None,
+            generation: 0,
         };
         let context = worker.engine.sync_context().unwrap().unwrap();
         let build = |context: &SyncContext| {

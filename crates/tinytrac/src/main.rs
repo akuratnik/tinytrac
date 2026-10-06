@@ -1,6 +1,7 @@
 //! tinytrac: a tiny native time tracker.
 
 mod app;
+mod credentials;
 mod data;
 mod duration;
 mod screen;

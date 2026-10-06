@@ -21,13 +21,35 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct State {
     sync_folder: String,
+    pub sync_mode: SyncMode,
     break_minutes: String,
     work_minutes: String,
     tag_names: BTreeMap<TagId, String>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    #[default]
+    Off,
+    Google,
+    Folder,
+}
+impl std::fmt::Display for SyncMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "Off",
+            Self::Google => "Google Drive",
+            Self::Folder => "Folder",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
+    SyncMode(SyncMode),
+    SignIn,
+    CancelSignIn,
+    SignOut,
     SyncFolder(String),
     SaveSyncFolder,
     BreakBank(bool),
@@ -44,6 +66,11 @@ impl State {
     pub fn new(data: &Data) -> Self {
         let policy = data.settings.break_policy;
         Self {
+            sync_mode: match &data.sync_target {
+                None => SyncMode::Off,
+                Some(SyncTarget::Folder(_)) => SyncMode::Folder,
+                Some(SyncTarget::Remote { .. }) => SyncMode::Google,
+            },
             sync_folder: match &data.sync_target {
                 Some(SyncTarget::Folder(path)) => path.display().to_string(),
                 _ => String::new(),
@@ -56,6 +83,9 @@ impl State {
 
     pub fn update(&mut self, message: Message, engine: &mut Engine) -> Result {
         match message {
+            Message::SyncMode(_) | Message::SignIn | Message::CancelSignIn | Message::SignOut => {
+                unreachable!("account actions are handled by the app")
+            }
             Message::SyncFolder(folder) => {
                 self.sync_folder = folder;
                 return Ok(Outcome::Edited);
@@ -119,7 +149,14 @@ impl State {
         ))
     }
 
-    pub fn view<'a>(&'a self, data: &'a Data, sync_status: &'a str) -> Element<'a, Message> {
+    pub fn view<'a>(
+        &'a self,
+        data: &'a Data,
+        sync_status: &'a str,
+        google_available: bool,
+        waiting: bool,
+        auth_required: bool,
+    ) -> Element<'a, Message> {
         let settings = data.settings;
         let break_bank = column![
             toggler(settings.break_bank)
@@ -182,26 +219,13 @@ impl State {
             heading("Settings"),
             break_bank,
             week_start,
-            text("Sync folder"),
-            row![
-                text_input("Folder path (empty disables sync)", &self.sync_folder)
-                    .on_input(Message::SyncFolder)
-                    .on_submit(Message::SaveSyncFolder),
-                button("Save folder")
-                    .style(button::secondary)
-                    .on_press(Message::SaveSyncFolder),
-            ]
-            .spacing(6),
+            self.sync_view(data, google_available, waiting, auth_required),
             muted(if data.sync_target.is_none() {
                 "Sync disabled"
             } else {
                 sync_status
             }),
         ]
-        .extend(data.sync_target.iter().filter_map(|target| match target {
-            SyncTarget::Remote { label, .. } => Some(muted(label).into()),
-            SyncTarget::Folder(_) => None,
-        }))
         .extend(diagnostics(&data.sync_diagnostics).map(|message| muted(message).into()))
         .push(heading("Tags"))
         .push(muted(
@@ -210,6 +234,72 @@ impl State {
         .push(column(tags).spacing(6))
         .spacing(14)
         .into()
+    }
+    fn sync_view<'a>(
+        &'a self,
+        data: &'a Data,
+        google_available: bool,
+        waiting: bool,
+        auth_required: bool,
+    ) -> Element<'a, Message> {
+        let modes = sync_modes(google_available);
+        let mut sync = column![
+            text("Sync"),
+            pick_list(modes, Some(self.sync_mode), Message::SyncMode)
+        ]
+        .spacing(6);
+        match self.sync_mode {
+            SyncMode::Off => {}
+            SyncMode::Folder => {
+                sync = sync.push(text("Sync folder")).push(
+                    row![
+                        text_input("Folder path (empty disables sync)", &self.sync_folder)
+                            .on_input(Message::SyncFolder)
+                            .on_submit(Message::SaveSyncFolder),
+                        button("Save folder")
+                            .style(button::secondary)
+                            .on_press(Message::SaveSyncFolder),
+                    ]
+                    .spacing(6),
+                );
+            }
+            SyncMode::Google => {
+                if auth_required {
+                    sync = sync.push(text("Google sign-in expired; sign in again"));
+                }
+                if waiting {
+                    sync = sync.push(
+                        row![
+                            button("Waiting for browser…"),
+                            button("Cancel").on_press(Message::CancelSignIn)
+                        ]
+                        .spacing(6),
+                    );
+                } else if (auth_required || data.sync_target.is_none()) && google_available {
+                    sync = sync.push(button("Sign in with Google").on_press(Message::SignIn));
+                }
+                if let Some(SyncTarget::Remote { label, .. }) = &data.sync_target {
+                    if !auth_required {
+                        sync = sync.push(text(format!("Signed in as {label}")));
+                    }
+                    sync = sync.push(
+                        button("Sign out")
+                            .style(button::secondary)
+                            .on_press(Message::SignOut),
+                    );
+                }
+                sync = sync.push(muted("The first sync uploads this Mac's history. Sign in to the same Google account on both Macs."));
+            }
+        }
+        sync.into()
+    }
+}
+
+fn sync_modes(google_available: bool) -> Vec<SyncMode> {
+    if google_available {
+        vec![SyncMode::Off, SyncMode::Google, SyncMode::Folder]
+    } else {
+        vec![SyncMode::Off, SyncMode::Folder]
     }
 }
 
@@ -248,6 +338,12 @@ fn diagnostics(data: &tinytrac_engine::SyncDiagnostics) -> impl Iterator<Item = 
 mod tests {
     use super::*;
     use tinytrac_engine::SyncDiagnostics;
+
+    #[test]
+    fn google_option_requires_build_credentials() {
+        assert_eq!(sync_modes(false), [SyncMode::Off, SyncMode::Folder]);
+        assert!(sync_modes(true).contains(&SyncMode::Google));
+    }
 
     #[test]
     fn diagnostics_hide_zero_counts_and_use_singular_plural_and_latest() {

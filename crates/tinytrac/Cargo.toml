@@ -13,6 +13,8 @@ jiff.workspace = true
 thiserror.workspace = true
 tinytrac-core.workspace = true
 tinytrac-engine.workspace = true
+# App-side OAuth and the retained Google Drive sync transport.
+tinytrac-drive = { path = "../tinytrac-drive" }
 
 [dev-dependencies]
 iced_test.workspace = true
@@ -23,6 +25,12 @@ workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { workspace = true, features = ["ksni"] }
 zbus.workspace = true
+# Persistent GNOME Secret Service via pure-Rust zbus, sharing the async-io runtime.
+keyring = { version = "3.6.3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = { workspace = true, features = ["default"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Store refresh tokens in the native macOS Keychain.
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
