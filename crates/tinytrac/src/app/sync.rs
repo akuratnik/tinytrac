@@ -17,7 +17,7 @@ use crate::{data::Data, screen};
 /// Keeps authentication failures distinct across the cloneable UI message boundary.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Failure {
-    #[error("authentication required: {0}")]
+    #[error("{0}")]
     AuthRequired(String),
     #[error("{0}")]
     Other(String),
@@ -47,10 +47,8 @@ pub(super) struct State {
     pub(super) problems: SyncProblems,
     pub(super) status: String,
     last_success: Option<String>,
-    pub(super) auth_required: bool,
+    pub(super) auth_required: Option<String>,
     generation: u64,
-    pub(super) client: Option<tinytrac_drive::Client>,
-    pub(super) credentials: Arc<dyn crate::credentials::Store>,
 }
 
 impl State {
@@ -80,15 +78,13 @@ impl State {
             problems,
             status,
             last_success: None,
-            auth_required: false,
+            auth_required: None,
             generation: 0,
-            client: super::google::client(),
-            credentials: Arc::new(crate::credentials::Keychain),
         })
     }
 
-    pub(super) fn request(&mut self) -> Task<Message> {
-        if self.auth_required {
+    pub(super) fn request(&mut self, google: &super::google::State) -> Task<Message> {
+        if self.auth_required.is_some() {
             return Task::none();
         }
         let Some(engine) = self.engine.clone() else {
@@ -100,8 +96,8 @@ impl State {
         }
         self.syncing = true;
         let generation = self.generation;
-        let client = self.client.clone();
-        let credentials = self.credentials.clone();
+        let client = google.client.clone();
+        let credentials = google.credentials.clone();
         Task::perform(
             blocking(move || {
                 let mut worker = engine
@@ -112,7 +108,7 @@ impl State {
                     worker.transport = None;
                 }
                 worker
-                    .run(client, credentials.as_ref())
+                    .run(client, credentials.as_deref())
                     .map_err(Failure::from)
             }),
             move |result| Message::WorkerSynced(generation, result),
@@ -121,7 +117,7 @@ impl State {
 
     pub(super) fn invalidate(&mut self) {
         self.generation += 1;
-        self.auth_required = false;
+        self.auth_required = None;
         self.problems.transient.clear();
         self.last_success = None;
         self.status = "Not synced yet".into();
@@ -141,10 +137,16 @@ impl State {
         result: &Result<SyncRun, Failure>,
         data: &Data,
         now: &jiff::Zoned,
-    ) -> (Option<String>, Task<Message>) {
+    ) -> Option<String> {
         self.syncing = false;
-        self.auth_required = matches!(result, Err(Failure::AuthRequired(_)))
-            && matches!(data.sync_target, Some(SyncTarget::Remote { .. }));
+        self.auth_required = match result {
+            Err(Failure::AuthRequired(reason))
+                if matches!(data.sync_target, Some(SyncTarget::Remote { .. })) =>
+            {
+                Some(reason.clone())
+            }
+            _ => None,
+        };
         let mut problems = match result {
             Ok(run) => run
                 .skipped
@@ -181,13 +183,27 @@ impl State {
             }
         }
         let rejected = data.sync_diagnostics.rejected;
-        let banner = self.problems.update(rejected, problems);
-        let task = if std::mem::take(&mut self.queued) {
-            self.request()
+        self.problems.update(rejected, problems).map(|message| {
+            if self.auth_required.is_some() {
+                format!("{message}. Open Settings → Sync to sign in again")
+            } else {
+                message
+            }
+        })
+    }
+}
+
+impl super::App {
+    pub(super) fn finish_sync(&mut self, result: &Result<SyncRun, Failure>) -> Task<Message> {
+        let banner = self.sync.finish(result, &self.data, &self.engine.now());
+        if let Some(message) = banner {
+            self.error = Some(message);
+        }
+        if std::mem::take(&mut self.sync.queued) {
+            self.sync.request(&self.google)
         } else {
             Task::none()
-        };
-        (banner, task)
+        }
     }
 }
 
@@ -272,7 +288,7 @@ mod tests {
         let _ = state.finish(&Err(failure), &data, &later);
         assert_eq!(
             state.status,
-            "Sync failed at 12:01:00: authentication required: sign in\nLast successful sync at 12:00:00"
+            "Sync failed at 12:01:00: sign in\nLast successful sync at 12:00:00"
         );
         let _ = state.finish(&Ok(SyncRun::default()), &data, &later);
         assert_eq!(state.status, "Synced at 12:01:00: 0 exported, 0 imported");

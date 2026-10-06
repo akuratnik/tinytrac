@@ -5,9 +5,6 @@ use tinytrac_drive::Secret;
 pub enum Error {
     #[error("OS keychain unavailable; unlock your login keychain or GNOME Keyring and try again")]
     Unavailable,
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    #[error("OS keychain unsupported")]
-    Unsupported,
 }
 
 /// Install one native store before any workers or windows are started.
@@ -19,7 +16,7 @@ pub fn initialize() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     match store {
         Ok(store) => keyring_core::set_default_store(store),
-        Err(_) => eprintln!("tinytrac: {}", Error::Unavailable),
+        Err(error) => eprintln!("tinytrac: keychain: {error}"),
     }
 }
 
@@ -29,18 +26,21 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     fn delete(&self, account: &str) -> Result<(), Error>;
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 pub struct Keychain;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Keychain {
     fn entry(account: &str) -> Result<keyring_core::Entry, Error> {
-        keyring_core::Entry::new("net.expertstudio.tinytrac", account).map_err(keychain_error)
+        keyring_core::Entry::new("net.expertstudio.tinytrac", account)
+            .map_err(|error| keychain_error(&error))
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn keychain_error(_: keyring_core::Error) -> Error {
+fn keychain_error(error: &keyring_core::Error) -> Error {
+    eprintln!("tinytrac: keychain: {error}");
     Error::Unavailable
 }
 
@@ -50,32 +50,19 @@ impl Store for Keychain {
         match Self::entry(account)?.get_password() {
             Ok(token) => Ok(Some(Secret::new(token))),
             Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(error) => Err(keychain_error(error)),
+            Err(error) => Err(keychain_error(&error)),
         }
     }
     fn save(&self, account: &str, token: &Secret) -> Result<(), Error> {
         Self::entry(account)?
             .set_password(token.expose())
-            .map_err(keychain_error)
+            .map_err(|error| keychain_error(&error))
     }
     fn delete(&self, account: &str) -> Result<(), Error> {
         match Self::entry(account)?.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(error) => Err(keychain_error(error)),
+            Err(error) => Err(keychain_error(&error)),
         }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-impl Store for Keychain {
-    fn load(&self, _: &str) -> Result<Option<Secret>, Error> {
-        Err(Error::Unsupported)
-    }
-    fn save(&self, _: &str, _: &Secret) -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-    fn delete(&self, _: &str) -> Result<(), Error> {
-        Err(Error::Unsupported)
     }
 }
 

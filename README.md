@@ -41,14 +41,16 @@ again; ordinary connection failures retry on the next scheduled sync.
 
 ### Build with Google credentials
 
-Google Drive is hidden in builds without client credentials. Enable the Drive API
-in your Google Cloud project, configure its OAuth consent screen (including test
-users while in testing), create a **Desktop app** OAuth client, and download its
+Google Drive is available on macOS and Linux in builds with client credentials. Enable the Drive API
+in your Google Cloud project, set its OAuth consent screen to **In production**, create a **Desktop app** OAuth client, and download its
 JSON to `~/.config/tinytrac/google-client.json`. With `jq` installed:
 
 ```sh
 export TINYTRAC_GOOGLE_CLIENT_ID="$(jq -er '.installed.client_id' ~/.config/tinytrac/google-client.json)" TINYTRAC_GOOGLE_CLIENT_SECRET="$(jq -er '.installed.client_secret' ~/.config/tinytrac/google-client.json)"; cargo build --release -p tinytrac
 ```
+
+Leaving the consent screen in **Testing** expires refresh tokens after seven days.
+The `drive.appdata` scope is non-sensitive and does not require verification.
 
 These values are embedded at build time; the Desktop client secret is not a
 confidential server credential. Keep the downloaded JSON outside the repository.

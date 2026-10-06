@@ -305,14 +305,19 @@ zbus 5 with the tray, uses pure Rust crypto, and does not link libdbus. There is
 The service is `net.expertstudio.tinytrac`; accounts are `google-drive:<permission id>`.
 Tests inject an in-memory store.
 
-`app/google.rs` owns authorization generations and cancellation flags. The
+`app/google.rs` owns the OAuth client, credential store, authorization generations and cancellation flags. The
 thread/oneshot helper runs OAuth off the UI thread. The browser launcher starts
 `open` or `xdg-open`; a separate thread reaps the child and reports launch failure
 without holding up callbacks or cancellation. Cancel, a replacement attempt, or a
-target selection invalidates the generation. Only a current completion can save
-the refresh token, then call `set_sync_target(Remote { id, label: email })`.
-A keychain save failure leaves the target unchanged. Local sign-out clears the
-target then deletes its keychain entry, without network revocation.
+target selection invalidates the generation. Only a current authorization can start saving
+the refresh token on a blocking worker. Its generation-checked completion calls `set_sync_target(Remote { id, label: email })`.
+A keychain save failure leaves the target unchanged. Account actions wait while a
+credential write is pending; stale saves restore the previous credential. Local
+sign-out clears the target, requests a worker run to drop its cache, then deletes
+the keychain entry off the UI thread, without network revocation. Replacing an
+account or saving a folder retires the old account through the same cleanup path.
+If browser launch fails, authorization keeps listening and Settings offers a
+copyable sign-in link.
 
 The sync worker loads the token when building a Drive transport and retains that
 transport across runs. Missing credentials or `AuthRequired` pause requests and
@@ -320,8 +325,11 @@ raise one problem banner; Settings offers sign-in again. Restart re-derives this
 state on the first run (a revoked token fails once). Successful sign-in invalidates
 the cache even for the same account and resumes sync. Worker completions carry a
 generation too, so an old authentication failure cannot expire a new sign-in.
-Folder, remote and Off choices all use the engine target setter, preserving its
-history republishing rules.
+Mode selection is only a form selection, with a notice naming the still-active
+destination. Saving a folder, successful sign-in and explicit Off use the engine
+target setter, preserving its history republishing rules. Keychain read errors
+remain retryable; only missing credentials or authentication rejection pause sync.
+Settings and the banner retain the authentication reason and point to sign-in.
 
 `authorize` binds `127.0.0.1:0` before launching the browser. It uses a random
 32-byte PKCE verifier (S256), an independent random state, the `drive.appdata`

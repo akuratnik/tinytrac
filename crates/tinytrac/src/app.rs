@@ -42,7 +42,9 @@ pub enum Message {
     #[cfg(test)]
     Synced(Result<SyncRun, sync::Failure>),
     WorkerSynced(u64, Result<SyncRun, sync::Failure>),
-    BrowserFinished(u64, Result<(), sync::Failure>),
+    BrowserFinished(u64, Option<String>),
+    CredentialsSaved(u64, Result<google::Saved, sync::Failure>),
+    CredentialsDeleted(u64, Result<(), sync::Failure>),
     SignedIn(u64, Result<Option<google::SignedIn>, sync::Failure>),
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
@@ -102,24 +104,50 @@ impl App {
                 eprintln!("tinytrac: cannot open {}: {error}", path.display());
                 std::process::exit(1);
             });
-        let task = Task::batch([app.open_window(), app.sync.request()]);
+        let task = Task::batch([app.open_window(), app.sync.request(&app.google)]);
         (app, task)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let outcome = match message {
+            Message::Refresh => return self.sync.request(&self.google),
+            Message::WorkerSynced(generation, result) => {
+                self.refresh();
+                if !self.sync.current(generation) {
+                    return self.sync.request(&self.google);
+                }
+                return self.finish_sync(&result);
+            }
+            #[cfg(test)]
+            Message::Synced(result) => {
+                self.refresh();
+                return self.finish_sync(&result);
+            }
+
+            Message::SignedIn(generation, result) => return self.signed_in(generation, result),
+            Message::BrowserFinished(generation, link) => {
+                return self.browser_finished(generation, link);
+            }
+            Message::CredentialsSaved(generation, result) => {
+                return self.credentials_saved(generation, result);
+            }
+            Message::CredentialsDeleted(generation, result) => {
+                return self.credentials_deleted(generation, result);
+            }
+            Message::Settings(settings::Message::SaveSyncFolder) => {
+                if self.google.busy() {
+                    return Task::none();
+                }
+                return self.change_target(self.settings.folder_target(), false);
+            }
+
             Message::Timers(message) => self.timers.update(message, &mut self.engine),
             Message::History(message) => self.history.update(message, &mut self.engine, &self.data),
             Message::Reports(message) => self.reports.update(message, &self.engine, &self.data),
             Message::Settings(settings::Message::Account(message)) => {
                 return self.google_action(&message);
             }
-            Message::Settings(message) => {
-                if matches!(message, settings::Message::SaveSyncFolder) {
-                    self.google.cancel();
-                }
-                self.settings.update(message, &mut self.engine)
-            }
+            Message::Settings(message) => self.settings.update(message, &mut self.engine),
             message => return self.lifecycle(message),
         };
         match outcome {
@@ -127,7 +155,7 @@ impl App {
             Ok(Outcome::Saved) => {
                 self.error = None;
                 self.refresh();
-                return self.sync.request();
+                return self.sync.request(&self.google);
             }
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -149,8 +177,12 @@ impl App {
 
     /// Reloads the data, e.g. after a command or to pick up changes made elsewhere.
     fn refresh(&mut self) {
+        self.refresh_sync(false);
+    }
+
+    fn refresh_sync(&mut self, renewed: bool) {
         let reloaded = Data::load(&self.engine).and_then(|data| {
-            if self.data.sync_target != data.sync_target {
+            if renewed || self.data.sync_target != data.sync_target {
                 self.google.cancel();
                 let same_identity = self
                     .data
@@ -158,7 +190,7 @@ impl App {
                     .as_ref()
                     .zip(data.sync_target.as_ref())
                     .is_some_and(|(old, new)| old.same_identity(new));
-                if !same_identity {
+                if renewed || !same_identity {
                     self.sync.invalidate();
                 }
             }
@@ -178,10 +210,10 @@ impl App {
     fn show(&mut self, screen: Screen) {
         if screen == Screen::Settings && self.screen != Screen::Settings {
             let selected = self.settings.sync_mode;
+            let folder = self.settings.folder_buffer().to_owned();
             self.settings = settings::State::new(&self.data);
-            if self.data.sync_target.is_none() {
-                self.settings.sync_mode = selected;
-            }
+            self.settings.sync_mode = selected;
+            self.settings.set_folder_buffer(folder);
         }
         self.screen = screen;
     }
@@ -222,9 +254,10 @@ impl App {
                 .view(
                     &self.data,
                     &self.sync.status,
-                    self.sync.client.is_some(),
-                    self.google.waiting(),
-                    self.sync.auth_required,
+                    self.google.account(
+                        self.data.sync_target.as_ref(),
+                        self.sync.auth_required.as_deref(),
+                    ),
                 )
                 .map(Message::Settings),
         };

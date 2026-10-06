@@ -48,8 +48,20 @@ impl std::fmt::Display for SyncMode {
 pub enum Account {
     SyncMode(SyncMode),
     SignIn,
+    CopyLink,
     CancelSignIn,
     SignOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AccountState<'a> {
+    Unavailable,
+    SignedOut,
+    Waiting,
+    Saving,
+    SignedIn(&'a str),
+    Expired { label: &'a str, reason: &'a str },
+    LinkFallback,
 }
 
 #[derive(Debug, Clone)]
@@ -86,19 +98,25 @@ impl State {
         }
     }
 
+    pub fn folder_buffer(&self) -> &str {
+        &self.sync_folder
+    }
+    pub fn set_folder_buffer(&mut self, folder: String) {
+        self.sync_folder = folder;
+    }
+
+    pub fn folder_target(&self) -> Option<SyncTarget> {
+        let folder = self.sync_folder.trim();
+        (!folder.is_empty()).then(|| SyncTarget::Folder(folder.into()))
+    }
+
     pub fn update(&mut self, message: Message, engine: &mut Engine) -> Result {
         match message {
             // The app routes account actions before invoking this screen.
-            Message::Account(_) => return Ok(Outcome::Edited),
+            Message::Account(_) | Message::SaveSyncFolder => return Ok(Outcome::Edited),
             Message::SyncFolder(folder) => {
                 self.sync_folder = folder;
                 return Ok(Outcome::Edited);
-            }
-            Message::SaveSyncFolder => {
-                let folder = self.sync_folder.trim();
-                engine.set_sync_target(
-                    (!folder.is_empty()).then(|| SyncTarget::Folder(folder.into())),
-                )?;
             }
             Message::BreakBank(on) => {
                 // Turning the bank on uses the ratio in the fields, saved or not.
@@ -157,9 +175,7 @@ impl State {
         &'a self,
         data: &'a Data,
         sync_status: &'a str,
-        google_available: bool,
-        waiting: bool,
-        auth_required: bool,
+        account: AccountState<'a>,
     ) -> Element<'a, Message> {
         let settings = data.settings;
         let break_bank = column![
@@ -223,7 +239,7 @@ impl State {
             heading("Settings"),
             break_bank,
             week_start,
-            self.sync_view(data, google_available, waiting, auth_required),
+            self.sync_view(data, account),
             muted(if data.sync_target.is_none() {
                 "Sync disabled"
             } else {
@@ -239,21 +255,21 @@ impl State {
         .spacing(14)
         .into()
     }
-    fn sync_view<'a>(
-        &'a self,
-        data: &'a Data,
-        google_available: bool,
-        waiting: bool,
-        auth_required: bool,
-    ) -> Element<'a, Message> {
-        let modes = sync_modes(google_available);
-        let mut sync = column![
-            text("Sync"),
-            pick_list(modes, Some(self.sync_mode), |mode| Message::Account(
-                Account::SyncMode(mode)
-            ))
-        ]
-        .spacing(6);
+    fn sync_view<'a>(&'a self, data: &'a Data, account: AccountState<'a>) -> Element<'a, Message> {
+        let busy = matches!(account, AccountState::Saving);
+        let modes = sync_modes(!matches!(account, AccountState::Unavailable));
+        let selection: Element<'_, Message> = if busy {
+            text(self.sync_mode.to_string()).into()
+        } else {
+            pick_list(modes, Some(self.sync_mode), |mode| {
+                Message::Account(Account::SyncMode(mode))
+            })
+            .into()
+        };
+        let mut sync = column![text("Sync"), selection].spacing(6);
+        if busy && self.sync_mode != SyncMode::Google {
+            sync = sync.push(text("Updating keychain…"));
+        }
         match self.sync_mode {
             SyncMode::Off => {}
             SyncMode::Folder => {
@@ -264,40 +280,72 @@ impl State {
                             .on_submit(Message::SaveSyncFolder),
                         button("Save folder")
                             .style(button::secondary)
-                            .on_press(Message::SaveSyncFolder),
+                            .on_press_maybe((!busy).then_some(Message::SaveSyncFolder)),
                     ]
                     .spacing(6),
                 );
             }
             SyncMode::Google => {
-                if auth_required {
-                    sync = sync.push(text("Google sign-in expired; sign in again"));
-                }
-                if waiting {
-                    sync = sync.push(
-                        row![
-                            button("Waiting for browser…"),
-                            button("Cancel").on_press(Message::Account(Account::CancelSignIn))
-                        ]
-                        .spacing(6),
-                    );
-                } else if (auth_required || data.sync_target.is_none()) && google_available {
-                    sync = sync.push(
-                        button("Sign in with Google").on_press(Message::Account(Account::SignIn)),
-                    );
-                }
-                if let Some(SyncTarget::Remote { label, .. }) = &data.sync_target {
-                    if !auth_required {
-                        sync = sync.push(text(format!("Signed in as {label}")));
+                let sign_in =
+                    || button("Sign in with Google").on_press(Message::Account(Account::SignIn));
+                let sign_out = || {
+                    button("Sign out")
+                        .style(button::secondary)
+                        .on_press(Message::Account(Account::SignOut))
+                };
+                match account {
+                    AccountState::Unavailable => {
+                        sync = sync.push(text("Google sign-in is unavailable in this build"));
+                        if matches!(data.sync_target, Some(SyncTarget::Remote { .. })) {
+                            sync = sync.push(sign_out());
+                        }
                     }
-                    sync = sync.push(
-                        button("Sign out")
-                            .style(button::secondary)
-                            .on_press(Message::Account(Account::SignOut)),
-                    );
+                    AccountState::SignedOut => sync = sync.push(sign_in()),
+                    AccountState::Waiting | AccountState::LinkFallback => {
+                        sync = sync.push(text("Waiting for browser…"));
+                        if matches!(account, AccountState::LinkFallback) {
+                            sync = sync.push(text("Could not open the browser. Copy the link and open it in your browser."))
+                                .push(button("Copy sign-in link").on_press(Message::Account(Account::CopyLink)));
+                        }
+                        sync = sync.push(
+                            button("Cancel").on_press(Message::Account(Account::CancelSignIn)),
+                        );
+                    }
+                    AccountState::Saving => sync = sync.push(text("Updating keychain…")),
+                    AccountState::SignedIn(label) => {
+                        sync = sync
+                            .push(text(format!("Signed in as {label}")))
+                            .push(sign_in())
+                            .push(sign_out());
+                    }
+                    AccountState::Expired { label, reason } => {
+                        sync = sync
+                            .push(text(format!("{label}: {reason}")))
+                            .push(sign_in())
+                            .push(sign_out());
+                    }
                 }
                 sync = sync.push(muted("The first sync uploads this Mac's history. Sign in to the same Google account on both Macs."));
             }
+        }
+        let active = match &data.sync_target {
+            Some(SyncTarget::Folder(path)) if self.sync_mode != SyncMode::Folder => {
+                Some(path.display().to_string())
+            }
+            Some(SyncTarget::Remote { label, .. }) if self.sync_mode != SyncMode::Google => {
+                Some(label.clone())
+            }
+            _ => None,
+        };
+        if let Some(active) = active {
+            let action = if self.sync_mode == SyncMode::Folder {
+                "save a folder"
+            } else {
+                "finish signing in"
+            };
+            sync = sync.push(text(format!(
+                "Still syncing to {active} until you {action}."
+            )));
         }
         sync.into()
     }
@@ -346,6 +394,57 @@ fn diagnostics(data: &tinytrac_engine::SyncDiagnostics) -> impl Iterator<Item = 
 mod tests {
     use super::*;
     use tinytrac_engine::SyncDiagnostics;
+
+    #[test]
+    fn account_controls_match_state() {
+        let engine = Engine::open_in_memory().unwrap();
+        let data = Data::load(&engine).unwrap();
+        let state = State {
+            sync_mode: SyncMode::Google,
+            ..State::new(&data)
+        };
+        let controls = [
+            "Sign in with Google",
+            "Sign out",
+            "Cancel",
+            "Copy sign-in link",
+            "Updating keychain…",
+        ];
+        for (account, expected) in [
+            (AccountState::Unavailable, vec![]),
+            (AccountState::SignedOut, vec!["Sign in with Google"]),
+            (AccountState::Waiting, vec!["Cancel"]),
+            (AccountState::Saving, vec!["Updating keychain…"]),
+            (
+                AccountState::SignedIn("me@example.com"),
+                vec!["Sign in with Google", "Sign out"],
+            ),
+            (
+                AccountState::Expired {
+                    label: "me@example.com",
+                    reason: "Permission revoked",
+                },
+                vec!["Sign in with Google", "Sign out"],
+            ),
+            (
+                AccountState::LinkFallback,
+                vec!["Cancel", "Copy sign-in link"],
+            ),
+        ] {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                iced::Size::new(600.0, 1000.0),
+                state.view(&data, "Not synced yet", account),
+            );
+            for control in controls {
+                assert_eq!(
+                    ui.find(control).is_ok(),
+                    expected.contains(&control),
+                    "{account:?}: {control}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn google_option_requires_build_credentials() {

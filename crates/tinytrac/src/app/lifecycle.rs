@@ -38,25 +38,6 @@ impl App {
             Message::Tick => {
                 self.tick();
             }
-            Message::Refresh => return self.sync.request(),
-            Message::BrowserFinished(generation, result) => {
-                if let Err(error) = result {
-                    return self.signed_in(generation, Err(error));
-                }
-            }
-            Message::SignedIn(generation, result) => return self.signed_in(generation, result),
-            Message::WorkerSynced(generation, result) => {
-                self.refresh();
-                if !self.sync.current(generation) {
-                    return self.sync.request();
-                }
-                return self.finish_sync(&result);
-            }
-            #[cfg(test)]
-            Message::Synced(result) => {
-                self.refresh();
-                return self.finish_sync(&result);
-            }
             Message::Show(screen) => {
                 self.show(screen);
             }
@@ -66,7 +47,15 @@ impl App {
             Message::DismissError => {
                 self.error = None;
             }
-            Message::Timers(_)
+            #[cfg(test)]
+            Message::Synced(_) => unreachable!("sync messages are handled by update"),
+            Message::Refresh
+            | Message::WorkerSynced(..)
+            | Message::SignedIn(..)
+            | Message::BrowserFinished(..)
+            | Message::CredentialsSaved(..)
+            | Message::CredentialsDeleted(..)
+            | Message::Timers(_)
             | Message::History(_)
             | Message::Reports(_)
             | Message::Settings(_) => {
@@ -74,17 +63,6 @@ impl App {
             }
         }
         Task::none()
-    }
-
-    fn finish_sync(
-        &mut self,
-        result: &Result<tinytrac_engine::SyncRun, super::sync::Failure>,
-    ) -> Task<Message> {
-        let (banner, task) = self.sync.finish(result, &self.data, &self.engine.now());
-        if let Some(message) = banner {
-            self.error = Some(message);
-        }
-        task
     }
 
     pub(super) fn open_window(&mut self) -> Task<Message> {

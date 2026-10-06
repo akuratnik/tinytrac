@@ -3,53 +3,28 @@
 use tinytrac_engine::{Engine, Folder, SyncContext, SyncRun, SyncTarget, Transport};
 
 /// Retains transport caches between serialized runs, bound to one context.
-#[derive(Debug)]
-pub(super) struct Worker<T = Backend> {
+pub(super) struct Worker<T: ?Sized = dyn Transport + Send> {
     pub(super) engine: Engine,
-    pub(super) transport: Option<T>,
+    pub(super) transport: Option<Box<T>>,
     pub(super) generation: u64,
 }
 
-#[derive(Debug)]
-pub(super) enum Backend {
-    Folder(Folder),
-    Drive(Box<tinytrac_drive::Drive>),
-}
-impl Transport for Backend {
-    fn context(&self) -> &SyncContext {
-        match self {
-            Self::Folder(t) => t.context(),
-            Self::Drive(t) => t.context(),
-        }
-    }
-    fn publish(&mut self, name: &str, bytes: &[u8]) -> tinytrac_engine::Result<()> {
-        match self {
-            Self::Folder(t) => t.publish(name, bytes),
-            Self::Drive(t) => t.publish(name, bytes),
-        }
-    }
-    fn list(&mut self) -> tinytrac_engine::Result<Vec<String>> {
-        match self {
-            Self::Folder(t) => t.list(),
-            Self::Drive(t) => t.list(),
-        }
-    }
-    fn read(&mut self, key: &str) -> tinytrac_engine::Result<Vec<u8>> {
-        match self {
-            Self::Folder(t) => t.read(key),
-            Self::Drive(t) => t.read(key),
-        }
+impl<T: ?Sized> std::fmt::Debug for Worker<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Worker")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
     }
 }
 impl Worker {
     pub(super) fn run(
         &mut self,
         client: Option<tinytrac_drive::Client>,
-        credentials: &dyn crate::credentials::Store,
+        credentials: Option<&dyn crate::credentials::Store>,
     ) -> tinytrac_engine::Result<SyncRun> {
         self.run_with(|context| {
             if let Some(folder) = Folder::for_context(context) {
-                return Ok(Backend::Folder(folder));
+                return Ok(Box::new(folder) as Box<dyn Transport + Send>);
             }
             let SyncTarget::Remote { id, .. } = context.target() else {
                 unreachable!()
@@ -59,28 +34,33 @@ impl Worker {
                     "This build has no Google client credentials".into(),
                 )
             })?;
+            let credentials = credentials.ok_or_else(|| {
+                tinytrac_engine::Error::AuthRequired(
+                    "Google sign-in is unavailable on this platform".into(),
+                )
+            })?;
             let token = credentials
                 .load(id)
-                .map_err(|error| tinytrac_engine::Error::AuthRequired(error.to_string()))?
+                .map_err(|error| tinytrac_engine::Error::Remote(error.to_string()))?
                 .ok_or_else(|| {
                     tinytrac_engine::Error::AuthRequired(
-                        "Google sign-in expired; sign in again".into(),
+                        "No saved Google sign-in; sign in again".into(),
                     )
                 })?;
-            Ok(Backend::Drive(Box::new(tinytrac_drive::Drive::new(
+            Ok(Box::new(tinytrac_drive::Drive::new(
                 client,
                 token,
                 context.clone(),
                 tinytrac_drive::Endpoints::default(),
-            ))))
+            )) as Box<dyn Transport + Send>)
         })
     }
 }
 
-impl<T: Transport> Worker<T> {
+impl<T: Transport + ?Sized> Worker<T> {
     fn run_with(
         &mut self,
-        build: impl FnOnce(&SyncContext) -> tinytrac_engine::Result<T>,
+        build: impl FnOnce(&SyncContext) -> tinytrac_engine::Result<Box<T>>,
     ) -> tinytrac_engine::Result<SyncRun> {
         let context = self.engine.sync_context()?;
         self.prepare(context.as_ref(), build)?;
@@ -90,7 +70,7 @@ impl<T: Transport> Worker<T> {
     fn prepare(
         &mut self,
         context: Option<&SyncContext>,
-        build: impl FnOnce(&SyncContext) -> tinytrac_engine::Result<T>,
+        build: impl FnOnce(&SyncContext) -> tinytrac_engine::Result<Box<T>>,
     ) -> tinytrac_engine::Result<()> {
         let reusable = self
             .transport
@@ -110,7 +90,7 @@ impl<T: Transport> Worker<T> {
         let Some(transport) = &mut self.transport else {
             return Ok(SyncRun::default());
         };
-        match self.engine.sync(transport) {
+        match self.engine.sync(transport.as_mut()) {
             Err(tinytrac_engine::Error::StaleSyncContext) => Ok(SyncRun::default()),
             result => result,
         }
@@ -153,6 +133,52 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_keychain_is_retryable() {
+        #[derive(Debug)]
+        struct Locked;
+        impl crate::credentials::Store for Locked {
+            fn load(
+                &self,
+                _: &str,
+            ) -> Result<Option<tinytrac_drive::Secret>, crate::credentials::Error> {
+                Err(crate::credentials::Error::Unavailable)
+            }
+            fn save(
+                &self,
+                _: &str,
+                _: &tinytrac_drive::Secret,
+            ) -> Result<(), crate::credentials::Error> {
+                unreachable!()
+            }
+            fn delete(&self, _: &str) -> Result<(), crate::credentials::Error> {
+                unreachable!()
+            }
+        }
+        let mut engine = Engine::open_in_memory().unwrap();
+        engine
+            .set_sync_target(Some(SyncTarget::Remote {
+                id: "old".into(),
+                label: "Old".into(),
+            }))
+            .unwrap();
+        let mut worker = Worker {
+            engine,
+            transport: None,
+            generation: 0,
+        };
+        assert!(matches!(
+            worker.run(
+                Some(tinytrac_drive::Client {
+                    id: "test".into(),
+                    secret: "test".into()
+                }),
+                Some(&Locked)
+            ),
+            Err(tinytrac_engine::Error::Remote(_))
+        ));
+    }
+
+    #[test]
     fn remote_without_token_requires_auth_before_network() {
         let mut engine = Engine::open_in_memory().unwrap();
         engine
@@ -172,7 +198,7 @@ mod tests {
             secret: "test".into(),
         };
         assert!(matches!(
-            worker.run(Some(client), &credentials),
+            worker.run(Some(client), Some(&credentials)),
             Err(tinytrac_engine::Error::AuthRequired(_))
         ));
         assert!(worker.transport.is_none());
@@ -182,11 +208,11 @@ mod tests {
     fn worker_preserves_caches_until_identity_or_epoch_changes() {
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
         let build = |context: &SyncContext| {
-            Ok(Cached {
+            Ok(Box::new(Cached {
                 context: context.clone(),
                 lists: 0,
                 drops: drops.clone(),
-            })
+            }))
         };
         let mut worker = Worker {
             engine: Engine::open_in_memory().unwrap(),
@@ -236,20 +262,20 @@ mod tests {
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut worker = Worker {
             engine,
-            transport: Some(Cached {
+            transport: Some(Box::new(Cached {
                 context: other.sync_context().unwrap().unwrap(),
                 lists: 0,
                 drops: drops.clone(),
-            }),
+            })),
             generation: 0,
         };
         worker
             .run_with(|context| {
-                Ok(Cached {
+                Ok(Box::new(Cached {
                     context: context.clone(),
                     lists: 0,
                     drops: drops.clone(),
-                })
+                }))
             })
             .unwrap();
         assert_eq!(drops.get(), 1);
@@ -272,11 +298,11 @@ mod tests {
         };
         let context = worker.engine.sync_context().unwrap().unwrap();
         let build = |context: &SyncContext| {
-            Ok(Cached {
+            Ok(Box::new(Cached {
                 context: context.clone(),
                 lists: 0,
                 drops: std::rc::Rc::new(std::cell::Cell::new(0)),
-            })
+            }))
         };
         worker.prepare(Some(&context), build).unwrap();
         worker.engine.set_sync_target(None).unwrap();
@@ -285,7 +311,7 @@ mod tests {
         let data = Data::load(&worker.engine).unwrap();
         let mut state = State::new(&worker.engine, &data).unwrap();
         let now = "2026-10-06T12:00:00[UTC]".parse::<jiff::Zoned>().unwrap();
-        assert!(state.finish(&Ok(run), &data, &now).0.is_none());
+        assert!(state.finish(&Ok(run), &data, &now).is_none());
         worker.run_with(build).unwrap();
         assert!(worker.transport.is_none());
     }
