@@ -3,25 +3,36 @@
 //! Local edits supersede all known heads, clearing their conflicts.
 //! Missing ancestors are allowed, so delivery order does not affect merging.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use tinytrac_core::{Session, Tag};
+use serde_json::value::RawValue;
+
 use uuid::Uuid;
 
 use crate::{
-    Error, Result, Settings,
-    store::{Index, Kind, Stored, replace},
+    Error, Result,
+    revisions::{Kind, index, merge},
+    store::Store,
     transport::Transport,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct SyncReport {
+pub struct SyncRun {
     pub exported: usize,
     pub imported: usize,
+    /// Retryable problems from this run only.
     pub skipped: Vec<SyncIssue>,
-    /// Current losing heads, retained in the revision history.
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncDiagnostics {
+    /// Rejected changes (or malformed files) remembered for this folder.
+    pub rejected: i64,
+    /// Most recently recorded permanent rejection.
+    pub reason: Option<String>,
+    /// Losing heads with a body different from the winner.
     pub conflicts: i64,
 }
 
@@ -34,11 +45,11 @@ pub struct SyncIssue {
 #[derive(Serialize, Deserialize)]
 struct Batch<T> {
     version: u32,
-    changes: Vec<T>,
+    changes: T,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Change {
+struct Change<B> {
     rev: String,
     record: String,
     kind: Kind,
@@ -46,16 +57,25 @@ struct Change {
     #[serde(default)]
     merges: Vec<String>,
     device: String,
-    body: Option<Box<serde_json::value::RawValue>>,
+    body: Option<B>,
+}
+
+// Borrowed RawValue needs an explicit serde borrow lifetime, unlike generic Batch.
+#[derive(Deserialize)]
+struct Envelope<'a> {
+    version: u32,
+    #[serde(borrow)]
+    changes: Option<&'a RawValue>,
 }
 
 pub(crate) fn run(
     db: &mut Connection,
     device: &str,
+    selected_epoch: i64,
     transport: &impl Transport,
-) -> Result<SyncReport> {
-    let mut report = SyncReport::default();
-    match export(db, device, transport) {
+) -> Result<SyncRun> {
+    let mut report = SyncRun::default();
+    match export(db, selected_epoch, transport) {
         Ok(count) => report.exported = count,
         Err(error) => report.skipped.push(SyncIssue {
             file: None,
@@ -65,7 +85,12 @@ pub(crate) fn run(
     match transport.list() {
         Ok(names) => {
             for name in names {
-                if let Err(error) = import_file(db, transport, &name, &mut report) {
+                if epoch(db)? != selected_epoch {
+                    break;
+                }
+                if let Err(error) =
+                    import_file(db, device, selected_epoch, transport, &name, &mut report)
+                {
                     report.skipped.push(SyncIssue {
                         file: Some(name),
                         reason: error.to_string(),
@@ -78,33 +103,58 @@ pub(crate) fn run(
             reason: format!("list: {error}"),
         }),
     }
-    report.conflicts = db.query_row("SELECT count(*) FROM conflicts", [], |row| row.get(0))?;
     Ok(report)
 }
 
-fn export(db: &mut Connection, device: &str, transport: &impl Transport) -> Result<usize> {
-    // Hold the writer lock through publication: only the selected rows are marked.
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (last, changes) = pending(&tx, device)?;
-    let mut exported = 0;
-    if !changes.is_empty() {
-        let bytes = serde_json::to_vec(&Batch {
-            version: 1,
-            changes,
-        })?;
-        transport.publish(&format!("{last:020}-{}.json", Uuid::now_v7()), &bytes)?;
-        exported = tx.execute(
-            "UPDATE changes SET exported = 1 WHERE device = ?1 AND exported = 0 AND seq <= ?2",
-            params![device, last],
-        )?;
-    }
-    tx.commit()?;
-    Ok(exported)
+pub(crate) fn diagnostics(db: &Connection) -> Result<SyncDiagnostics> {
+    Ok(SyncDiagnostics {
+        conflicts: db.query_row("SELECT count(*) FROM conflicts c JOIN changes h ON h.rev = c.rev JOIN records r ON r.id = c.record WHERE h.body IS NOT r.body", [], |row| row.get(0))?,
+        rejected: db.query_row("SELECT coalesce(sum(rejected), 0) FROM imported_files", [], |row| row.get(0))?,
+        reason: db.query_row("SELECT reason FROM imported_files WHERE reason IS NOT NULL ORDER BY rowid DESC LIMIT 1", [], |row| row.get(0)).optional()?,
+    })
 }
 
-fn pending(db: &Connection, device: &str) -> Result<(i64, Vec<Change>)> {
-    let mut statement = db.prepare("SELECT seq, rev, record, kind, parent, device, body, merges FROM changes WHERE device = ?1 AND exported = 0 ORDER BY seq")?;
-    let rows = statement.query_map([device], |row| {
+pub(crate) fn epoch(db: &Connection) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'sync_epoch'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn export(db: &mut Connection, selected_epoch: i64, transport: &impl Transport) -> Result<usize> {
+    let mut exported = 0;
+    loop {
+        let tx = db.transaction()?;
+        if epoch(&tx)? != selected_epoch {
+            return Ok(exported);
+        }
+        let (last, changes) = pending(&tx)?;
+        tx.commit()?;
+        if changes.is_empty() {
+            return Ok(exported);
+        }
+        let bytes = serde_json::to_vec(&Batch {
+            version: 1,
+            changes: &changes,
+        })?;
+        transport.publish(&format!("{last:020}-{}.json", Uuid::now_v7()), &bytes)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if epoch(&tx)? != selected_epoch {
+            return Ok(exported);
+        }
+        for change in &changes {
+            exported += tx
+                .prepare_cached("UPDATE changes SET exported = 1 WHERE rev = ?1 AND exported = 0")?
+                .execute([&change.rev])?;
+        }
+        tx.commit()?;
+    }
+}
+
+fn pending(db: &Connection) -> Result<(i64, Vec<Change<Box<RawValue>>>)> {
+    let mut statement = db.prepare("SELECT seq, rev, record, kind, parent, device, body, merges FROM changes WHERE exported = 0 ORDER BY seq LIMIT 1000")?;
+    let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -126,9 +176,7 @@ fn pending(db: &Connection, device: &str) -> Result<(i64, Vec<Change>)> {
             kind: kind.parse()?,
             parent,
             device,
-            body: body
-                .map(serde_json::value::RawValue::from_string)
-                .transpose()?,
+            body: body.map(RawValue::from_string).transpose()?,
             merges: serde_json::from_str(&merges)?,
         });
         last = seq;
@@ -138,9 +186,11 @@ fn pending(db: &Connection, device: &str) -> Result<(i64, Vec<Change>)> {
 
 fn import_file(
     db: &mut Connection,
+    device: &str,
+    selected_epoch: i64,
     transport: &impl Transport,
     name: &str,
-    report: &mut SyncReport,
+    report: &mut SyncRun,
 ) -> Result<()> {
     let known: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM imported_files WHERE name = ?1)",
@@ -151,62 +201,90 @@ fn import_file(
         return Ok(());
     }
     let bytes = transport.read(name)?;
-    // Loose values let one malformed change fail without rejecting its siblings.
-    let batch = serde_json::from_slice::<Batch<serde_json::Value>>(&bytes);
+    if epoch(db)? != selected_epoch {
+        return Ok(());
+    }
+    // Inspect the version before interpreting the version-specific payload.
+    let envelope = serde_json::from_slice::<Envelope>(&bytes);
+    if let Ok(envelope) = &envelope
+        && envelope.version != 1
+    {
+        return Err(Error::Sync(
+            "written by a newer tinytrac; update this device".into(),
+        ));
+    }
+    let batch = envelope.and_then(|envelope| {
+        serde_json::from_str::<Vec<&RawValue>>(envelope.changes.map_or("null", RawValue::get))
+    });
     if batch.as_ref().is_err_and(serde_json::Error::is_eof) {
-        // A file still being copied may end before its JSON is complete.
-        return Err(batch.err().expect("checked error").into());
+        return Err(batch.expect_err("checked error").into());
     }
     let mut tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if epoch(&tx)? != selected_epoch {
+        return Ok(());
+    }
+    let mut file = tx.savepoint()?;
     let mut imported = 0;
-    let mut skipped = Vec::new();
-    let batch = batch.map_err(Error::from).and_then(|batch| {
-        if batch.version != 1 {
-            return Err(Error::Sync(format!("unsupported format {}", batch.version)));
-        }
-        Ok(batch)
-    });
+    let mut rejected = 0;
+    let mut reason = None;
+    let mut affected = BTreeSet::new();
     match batch {
         Ok(batch) => {
-            for value in batch.changes {
-                let savepoint = tx.savepoint()?;
-                let result = serde_json::from_value::<Change>(value)
+            for value in batch {
+                let savepoint = file.savepoint()?;
+                let result = serde_json::from_str::<Change<&RawValue>>(value.get())
                     .map_err(Error::from)
-                    .and_then(|change| import_change(&savepoint, &change));
+                    .and_then(|change| {
+                        let inserted = import_change(&savepoint, &change)?;
+                        Ok(inserted.then_some(change.record))
+                    });
                 match result {
-                    Ok(inserted) => {
+                    Ok(record) => {
                         savepoint.commit()?;
-                        imported += usize::from(inserted);
+                        if let Some(record) = record {
+                            imported += 1;
+                            affected.insert(record);
+                        }
                     }
                     Err(error) if matches!(error, Error::Data(_) | Error::Sync(_)) => {
                         savepoint.finish()?;
-                        skipped.push(SyncIssue {
-                            file: Some(name.to_owned()),
-                            reason: error.to_string(),
-                        });
+                        rejected += 1;
+                        reason = Some(error.to_string());
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
-        Err(error) => skipped.push(SyncIssue {
-            file: Some(name.to_owned()),
-            reason: error.to_string(),
-        }),
+        Err(error) => {
+            rejected += 1;
+            reason = Some(error.to_string());
+        }
     }
-    tx.execute("INSERT INTO imported_files (name) VALUES (?1)", [name])?;
+    let merged = affected.iter().try_for_each(|record| merge(&file, record));
+    match merged {
+        Ok(()) => file.commit()?,
+        Err(Error::Sync(error)) => {
+            file.finish()?;
+            imported = 0;
+            rejected = 1;
+            reason = Some(error);
+        }
+        Err(error) => return Err(error),
+    }
+    Store::new(&tx, device).settle()?;
+    tx.execute(
+        "INSERT INTO imported_files (name, rejected, reason) VALUES (?1, ?2, ?3)",
+        params![name, rejected, reason],
+    )?;
     tx.commit()?;
     report.imported += imported;
-    report.skipped.extend(skipped);
     Ok(())
 }
 
-fn import_change(db: &Connection, change: &Change) -> Result<bool> {
-    let known: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM changes WHERE rev = ?1)",
-        [&change.rev],
-        |row| row.get(0),
-    )?;
+fn import_change(db: &Connection, change: &Change<&RawValue>) -> Result<bool> {
+    let known: bool = db
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM changes WHERE rev = ?1)")?
+        .query_row([&change.rev], |row| row.get(0))?;
     if known {
         return Ok(false);
     }
@@ -217,25 +295,17 @@ fn import_change(db: &Connection, change: &Change) -> Result<bool> {
             return Err(Error::Sync("revision is its own parent".into()));
         }
     }
-    let _ = index(
-        change.kind,
-        &change.record,
-        change.body.as_deref().map(serde_json::value::RawValue::get),
-    )?;
+    let _ = index(change.kind, &change.record, change.body.map(RawValue::get))?;
     let kind: Option<String> = db
-        .query_row(
-            "SELECT kind FROM records WHERE id = ?1",
-            [&change.record],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT kind FROM changes WHERE record = ?1 LIMIT 1")?
+        .query_row([&change.record], |row| row.get(0))
         .optional()?;
     if kind.is_some_and(|kind| kind != change.kind.to_string()) {
         return Err(Error::Sync("record changed kind".into()));
     }
-    let body = change.body.as_deref().map(serde_json::value::RawValue::get);
+    let body = change.body.map(RawValue::get);
     let merges = serde_json::to_string(&change.merges)?;
-    db.execute("INSERT INTO changes (rev, record, kind, parent, device, body, merges, exported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)", params![change.rev, change.record, change.kind, change.parent, change.device, body, merges])?;
-    merge(db, &change.record)?;
+    db.prepare_cached("INSERT INTO changes (rev, record, kind, parent, device, body, merges, exported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)")?.execute(params![change.rev, change.record, change.kind, change.parent, change.device, body, merges])?;
     Ok(true)
 }
 
@@ -247,108 +317,111 @@ fn validate_revision(rev: &str) -> Result<()> {
     Ok(())
 }
 
-fn index(kind: Kind, key: &str, body: Option<&str>) -> Result<Index> {
-    match kind {
-        Kind::Tag => typed_index::<Tag>(key, body),
-        Kind::Session => typed_index::<Session>(key, body),
-        Kind::Settings => typed_index::<Settings>(key, body),
-    }
-}
-
-fn typed_index<T: Stored>(key: &str, body: Option<&str>) -> Result<Index> {
-    if (T::KIND == Kind::Settings && key != "settings")
-        || (T::KIND != Kind::Settings && Uuid::parse_str(key).is_err())
-    {
-        return Err(Error::Sync("invalid record id".into()));
-    }
-    let Some(body) = body else {
-        return Ok(Index::default());
-    };
-    let record: T = serde_json::from_str(body)?;
-    if record.key() != key {
-        return Err(Error::Sync("body id does not match record".into()));
-    }
-    Ok(record.index())
-}
-
-/// Missing parents are allowed: an ancestor may arrive in a later batch.
-fn heads(revisions: &[(String, Option<String>, Vec<String>)]) -> Vec<&str> {
-    let parents: HashSet<_> = revisions
-        .iter()
-        .flat_map(|(_, parent, merges)| parent.iter().chain(merges).map(String::as_str))
-        .collect();
-    let mut heads: Vec<_> = revisions
-        .iter()
-        .map(|(rev, _, _)| rev.as_str())
-        .filter(|rev| !parents.contains(rev))
-        .collect();
-    heads.sort_unstable();
-    heads
-}
-
-pub(crate) fn merge(db: &Connection, record: &str) -> Result<()> {
-    let mut statement = db.prepare("SELECT rev, parent, merges FROM changes WHERE record = ?1")?;
-    let revisions = statement
-        .query_map([record], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|(rev, parent, merges)| Ok((rev, parent, serde_json::from_str(&merges)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let heads = heads(&revisions);
-    let Some((winner, losers)) = heads.split_last() else {
-        return Err(Error::Sync("revision graph has no head".into()));
-    };
-    let current: Option<String> = db
-        .query_row("SELECT rev FROM records WHERE id = ?1", [record], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    if current.as_deref() != Some(winner) {
-        let (kind, body): (String, Option<String>) = db.query_row(
-            "SELECT kind, body FROM changes WHERE rev = ?1",
-            [winner],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let kind = kind.parse()?;
-        replace(
-            db,
-            kind,
-            record,
-            winner,
-            body.as_deref(),
-            &index(kind, record, body.as_deref())?,
-        )?;
-    }
-    db.execute("DELETE FROM conflicts WHERE record = ?1", [record])?;
-    for loser in losers {
-        db.execute(
-            "INSERT INTO conflicts (rev, record) VALUES (?1, ?2)",
-            params![loser, record],
-        )?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::heads;
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::Engine;
+    use tinytrac_core::Tag;
+
+    struct Publisher<F>(F);
+
+    impl<F: Fn(&[u8])> Transport for Publisher<F> {
+        fn publish(&self, _: &str, bytes: &[u8]) -> Result<()> {
+            self.0(bytes);
+            Ok(())
+        }
+        fn list(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn read(&self, _: &str) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
 
     #[test]
-    fn ancestry_beats_timestamp_and_order() {
-        let mut revisions = vec![
-            ("z".into(), None, vec![]),
-            ("a".into(), Some("z".into()), vec![]),
-            ("b".into(), Some("missing".into()), vec![]),
-        ];
-        assert_eq!(heads(&revisions), ["a", "b"]);
-        revisions.reverse();
-        assert_eq!(heads(&revisions), ["a", "b"]);
-        revisions.push(("c".into(), Some("b".into()), vec!["a".into()]));
-        assert_eq!(heads(&revisions), ["c"]);
-        revisions.reverse();
-        assert_eq!(heads(&revisions), ["c"]);
-        assert!(heads(&[]).is_empty());
+    fn a_stale_epoch_stops_before_reading_or_parsing_more_files() {
+        struct Switching<'a> {
+            engine: RefCell<&'a mut Engine>,
+            reads: RefCell<usize>,
+            during_list: bool,
+        }
+        impl Transport for Switching<'_> {
+            fn publish(&self, _: &str, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn list(&self) -> Result<Vec<String>> {
+                if self.during_list {
+                    self.engine.borrow_mut().clear_sync_folder()?;
+                }
+                Ok(vec!["first.json".into(), "second.json".into()])
+            }
+            fn read(&self, _: &str) -> Result<Vec<u8>> {
+                *self.reads.borrow_mut() += 1;
+                self.engine.borrow_mut().clear_sync_folder()?;
+                // Parsing this would produce a retryable unsupported-version issue.
+                Ok(br#"{"version":2}"#.to_vec())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let mut engine = Engine::open(&path).unwrap();
+        let mut db = Connection::open(&path).unwrap();
+        for during_list in [true, false] {
+            let selected = epoch(&db).unwrap();
+            let transport = Switching {
+                engine: RefCell::new(&mut engine),
+                reads: RefCell::new(0),
+                during_list,
+            };
+            let run = run(&mut db, "test", selected, &transport).unwrap();
+            assert!(run.skipped.is_empty());
+            assert_eq!(*transport.reads.borrow(), usize::from(!during_list));
+            assert_eq!(run.imported, 0);
+        }
+        assert_eq!(diagnostics(&db).unwrap().rejected, 0);
+    }
+
+    #[test]
+    fn publication_releases_the_lock_and_a_folder_switch_preserves_pending_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let mut engine = Engine::open(&path).unwrap();
+        engine.set_sync_folder(root.path().join("old")).unwrap();
+        let mut db = Connection::open(&path).unwrap();
+        let tx = db.transaction().unwrap();
+        let store = Store::new(&tx, "test-device");
+        for number in 0..1001 {
+            store
+                .put(&Tag::new(&format!("Tag {number}")).unwrap())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let selected = epoch(&db).unwrap();
+        let switch = Publisher(|_: &[u8]| {
+            // A second writer can commit while publication is in progress.
+            let mut other = Engine::open(&path).unwrap();
+            other.create_tag("During publication").unwrap();
+            other.set_sync_folder(root.path().join("new")).unwrap();
+        });
+        assert_eq!(export(&mut db, selected, &switch).unwrap(), 0);
+        let pending: i64 = db
+            .query_row(
+                "SELECT count(*) FROM changes WHERE exported = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1002);
+        let sizes = RefCell::new(Vec::new());
+        let publisher = Publisher(|bytes: &[u8]| {
+            let batch: Batch<Vec<&RawValue>> = serde_json::from_slice(bytes).unwrap();
+            sizes.borrow_mut().push(batch.changes.len());
+        });
+        assert_eq!(export(&mut db, selected, &publisher).unwrap(), 0);
+        let selected = epoch(&db).unwrap();
+        assert_eq!(export(&mut db, selected, &publisher).unwrap(), 1002);
+        assert_eq!(*sizes.borrow(), [1000, 2]);
     }
 }

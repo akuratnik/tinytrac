@@ -361,7 +361,7 @@ impl TryFrom<RawSession> for Session {
             }
             previous_end = segment.end;
         }
-        Ok(Self {
+        let session = Self {
             id: raw.id,
             tag: raw.tag,
             day: raw.day,
@@ -369,7 +369,16 @@ impl TryFrom<RawSession> for Session {
             segments: raw.segments,
             adjustment: raw.adjustment,
             stopped: raw.stopped,
-        })
+        };
+        // Logged time never decreases after the last recorded instant.
+        let at = session
+            .segments
+            .last()
+            .map_or(Timestamp::MIN, |s| s.end.unwrap_or(s.start));
+        if session.adjustment.is_negative() && session.logged(at).is_negative() {
+            return Err(SessionError::NegativeDuration);
+        }
+        Ok(session)
     }
 }
 
@@ -618,5 +627,26 @@ mod tests {
         let mut json = serde_json::to_value(&session).unwrap();
         json["adjustment"] = serde_json::to_value(too_long).unwrap();
         assert!(serde_json::from_value::<Session>(json).is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_negative_logged_time() {
+        let tag = TagId::generate();
+        let manual = Session::manual(tag, jiff::civil::date(2026, 10, 1), MIN).unwrap();
+        let mut value = serde_json::to_value(manual).unwrap();
+        value["adjustment"] = serde_json::to_value(-MIN).unwrap();
+        assert!(serde_json::from_value::<Session>(value).is_err());
+
+        let mut tracked = Session::start(tag, None, &at(0).to_zoned(jiff::tz::TimeZone::UTC));
+        tracked.pause(at(10)).unwrap();
+        let mut value = serde_json::to_value(&tracked).unwrap();
+        value["adjustment"] = serde_json::to_value(-MIN * 11).unwrap();
+        assert!(serde_json::from_value::<Session>(value).is_err());
+        tracked.resume(at(20)).unwrap();
+        tracked.set_logged(MIN * 5, at(25)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Session>(&serde_json::to_string(&tracked).unwrap()).unwrap(),
+            tracked
+        );
     }
 }

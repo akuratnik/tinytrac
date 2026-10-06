@@ -34,30 +34,35 @@ impl Timers {
     /// Builds the timers from stored sessions, skipping stopped ones.
     ///
     /// Two devices that were offline can each open a session for the same tag.
-    /// The most recently active one is kept and the others are stopped at `now`,
-    /// keeping their recorded time. Returns those stopped sessions for persisting.
-    pub fn load(
-        sessions: impl IntoIterator<Item = Session>,
-        now: Timestamp,
-    ) -> (Self, Vec<Session>) {
+    /// Rank by (is running, last state change, id): running beats paused.
+    /// Paused losers keep all their time; only their stopped flag changes.
+    /// Of two running sessions, the later start wins and the earlier stops there,
+    /// like an exclusive start. Repairs are identical regardless of device clocks.
+    /// Returns stopped losers for persisting; segmentless winners use `Timestamp::MIN`.
+    pub fn load(sessions: impl IntoIterator<Item = Session>) -> (Self, Vec<Session>) {
+        let mut sessions: Vec<_> = sessions
+            .into_iter()
+            .filter(|session| session.status() != Status::Stopped)
+            .collect();
+        sessions.sort_by_key(|session| {
+            (
+                matches!(session.status(), Status::Running(_)),
+                last_active(session),
+            )
+        });
         let mut open = BTreeMap::new();
         let mut stopped = Vec::new();
-        for session in sessions {
-            if session.status() == Status::Stopped {
-                continue;
-            }
-            let mut older = match open.entry(session.tag) {
+        for mut session in sessions.into_iter().rev() {
+            match open.entry(session.tag) {
                 Entry::Vacant(entry) => {
                     entry.insert(session);
-                    continue;
                 }
-                Entry::Occupied(mut entry) if last_active(&session) > last_active(entry.get()) => {
-                    entry.insert(session)
+                Entry::Occupied(entry) => {
+                    let at = last_active(entry.get()).0.unwrap_or(Timestamp::MIN);
+                    if session.stop(at).is_ok() {
+                        stopped.push(session);
+                    }
                 }
-                Entry::Occupied(_) => session,
-            };
-            if older.stop(now).is_ok() {
-                stopped.push(older);
             }
         }
         (Self { open }, stopped)
@@ -256,10 +261,46 @@ mod tests {
         let desktop = Session::start(tag, None, &at(0));
         let laptop = Session::start(tag, None, &at(5));
 
-        let (timers, stopped) = Timers::load([laptop.clone(), desktop.clone()], at(10).timestamp());
+        let (timers, stopped) = Timers::load([laptop.clone(), desktop.clone()]);
         assert_eq!(timers.get(tag).map(|s| s.id), Some(laptop.id));
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].id, desktop.id);
-        assert_eq!(stopped[0].logged(at(99).timestamp()), MIN * 10);
+        assert_eq!(stopped[0].logged(at(99).timestamp()), MIN * 5);
+    }
+
+    #[test]
+    fn running_work_survives_a_later_pause_on_another_device() {
+        let tag = TagId::generate();
+        let laptop = Session::start(tag, None, &at(9 * 60)); // 09:00
+        let mut desktop = Session::start(tag, None, &at(9 * 60));
+        desktop.pause(at(9 * 60 + 20).timestamp()).unwrap(); // 09:20
+        let (timers, stopped) = Timers::load([laptop.clone(), desktop.clone()]);
+        assert_eq!(timers.get(tag).unwrap().id, laptop.id);
+        assert_eq!(
+            timers.get(tag).unwrap().logged(at(17 * 60).timestamp()),
+            MIN * 480
+        ); // 17:00
+        assert_eq!(stopped[0].segments(), desktop.segments());
+        assert_eq!(stopped[0].logged(at(17 * 60).timestamp()), MIN * 20);
+        desktop.stop(at(9 * 60 + 20).timestamp()).unwrap();
+        assert_eq!(stopped, [desktop]);
+    }
+
+    #[test]
+    fn all_losers_stop_at_the_final_winner_regardless_of_order() {
+        let tag = TagId::generate();
+        let sessions: Vec<_> = [0, 5, 10]
+            .map(|minute| Session::start(tag, None, &at(minute)))
+            .into();
+        let (_, mut first) = Timers::load(sessions.clone());
+        let (_, mut second) = Timers::load(sessions.into_iter().rev());
+        first.sort_by_key(|session| session.id);
+        second.sort_by_key(|session| session.id);
+        assert_eq!(first, second);
+        assert!(
+            first
+                .iter()
+                .all(|s| s.segments().last().unwrap().end == Some(at(10).timestamp()))
+        );
     }
 }

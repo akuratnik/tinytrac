@@ -1,6 +1,6 @@
 //! The break bank, week start, and tag management.
 
-use std::{collections::BTreeMap, num::NonZeroU32};
+use std::{collections::BTreeMap, fmt::Write, num::NonZeroU32};
 
 use iced::{
     Alignment::Center,
@@ -159,7 +159,7 @@ impl State {
                 .tag_names
                 .get(&tag.id)
                 .map_or(tag.name(), String::as_str);
-            row![
+            let row = row![
                 text_input("Name", name)
                     .on_input(move |name| Message::TagName(tag.id, name))
                     .on_submit(Message::RenameTag(tag.id)),
@@ -168,8 +168,12 @@ impl State {
                     .on_toggle(move |archived| Message::Archive(tag.id, archived)),
             ]
             .spacing(8)
-            .align_y(Center)
-            .into()
+            .align_y(Center);
+            if data.tag_name(tag.id) == tag.name() {
+                row.into()
+            } else {
+                column![muted(data.tag_name(tag.id)), row].spacing(4).into()
+            }
         });
 
         column![
@@ -186,12 +190,82 @@ impl State {
                     .on_press(Message::SaveSyncFolder),
             ]
             .spacing(6),
-            muted(sync_status),
-            heading("Tags"),
-            muted("Press Enter to rename. Archived tags keep their history."),
-            column(tags).spacing(6),
+            muted(if data.sync_folder.is_empty() {
+                "Sync disabled"
+            } else {
+                sync_status
+            }),
         ]
+        .extend(diagnostics(&data.sync_diagnostics).map(|message| muted(message).into()))
+        .push(heading("Tags"))
+        .push(muted(
+            "Press Enter to rename. Archived tags keep their history.",
+        ))
+        .push(column(tags).spacing(6))
         .spacing(14)
         .into()
+    }
+}
+
+fn diagnostics(data: &tinytrac_engine::SyncDiagnostics) -> impl Iterator<Item = String> {
+    let conflicts = (data.conflicts > 0).then(|| {
+        format!(
+            "{} {} made on two devices at once; the newer one was kept.",
+            data.conflicts,
+            if data.conflicts == 1 {
+                "edit was"
+            } else {
+                "edits were"
+            }
+        )
+    });
+    let rejected = (data.rejected > 0).then(|| {
+        let mut message = format!(
+            "{} {} from other devices {} rejected",
+            data.rejected,
+            if data.rejected == 1 {
+                "change"
+            } else {
+                "changes"
+            },
+            if data.rejected == 1 { "was" } else { "were" }
+        );
+        if let Some(reason) = &data.reason {
+            let _ = write!(message, " (latest: {reason})");
+        }
+        message
+    });
+    conflicts.into_iter().chain(rejected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tinytrac_engine::SyncDiagnostics;
+
+    #[test]
+    fn diagnostics_hide_zero_counts_and_use_singular_plural_and_latest() {
+        assert_eq!(diagnostics(&SyncDiagnostics::default()).count(), 0);
+        let mut data = SyncDiagnostics {
+            conflicts: 1,
+            rejected: 1,
+            reason: Some("bad body".into()),
+        };
+        assert_eq!(
+            diagnostics(&data).collect::<Vec<_>>(),
+            [
+                "1 edit was made on two devices at once; the newer one was kept.",
+                "1 change from other devices was rejected (latest: bad body)",
+            ]
+        );
+        data.conflicts = 2;
+        data.rejected = 2;
+        assert_eq!(
+            diagnostics(&data).collect::<Vec<_>>(),
+            [
+                "2 edits were made on two devices at once; the newer one was kept.",
+                "2 changes from other devices were rejected (latest: bad body)",
+            ]
+        );
     }
 }

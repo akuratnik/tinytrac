@@ -31,10 +31,22 @@ Create a shared Syncthing folder and let it replicate between your devices.
 On each device, start tinytrac with its own fresh database, open **Settings**, enter
 that device's **Sync folder** path, and press Enter or **Save folder**. Keep each
 SQLite database outside the shared folder; do not copy a database to another device.
-Changes sync after saves and every 30 seconds. Clear the field and save to disable.
+Sync runs in the background at startup, after saves and every 30 seconds. Clear the
+field and save to disable. Switching to a different folder republishes all known
+history, including deletions and revisions received from other devices, so a fresh
+peer can catch up. Re-selecting the same folder does nothing; clearing then re-setting
+it safely republishes.
+
+Settings keeps a durable summary of rejected changes and the latest reason, plus
+conflicts and the last sync result. New problems also appear in the main error
+banner; dismissing it suppresses repeats until something new appears. Files written
+in an unsupported newer format stay pending: update that device's tinytrac to read
+them. Other files continue syncing.
+
 Concurrent edits keep the newer revision and show a notice; the other revision
-remains in the history. Editing that record again resolves all known conflicting
-versions and clears the notice after syncing. Keep the shared folder private and
+remains in the history. Conflict notices can also come from automatic timer repairs
+made on devices with different partial histories. Editing that record again resolves
+all known conflicting versions and clears the notice after syncing. Keep the shared folder private and
 do not delete its batches.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how it fits together.

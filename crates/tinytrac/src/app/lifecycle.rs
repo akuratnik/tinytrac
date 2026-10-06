@@ -38,8 +38,14 @@ impl App {
             Message::Tick => {
                 self.tick();
             }
-            Message::Refresh => {
+            Message::Refresh => return self.sync.request(),
+            Message::Synced(result) => {
                 self.refresh();
+                let (banner, task) = self.sync.finish(&result, &self.data, &self.engine.now());
+                if let Some(message) = banner {
+                    self.error = Some(message);
+                }
+                return task;
             }
             Message::Show(screen) => {
                 self.show(screen);

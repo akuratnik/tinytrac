@@ -4,18 +4,20 @@
 //! derived from them. Every write also appends a revision to `changes`, which is
 //! what sync exchanges between devices.
 
-use std::{fmt, str::FromStr};
-
 use rusqlite::{Connection, OptionalExtension, Params, params};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tinytrac_core::{DateRange, Session, Status, Tag, TimeZone, Timestamp};
+use serde::de::DeserializeOwned;
+use tinytrac_core::{DateRange, Session, TimeZone, Timers};
 use uuid::Uuid;
 
-use crate::{Error, Result, Settings};
+use crate::{
+    Error, Result, Settings,
+    revisions::{self, Index, Kind, SETTINGS, Stored},
+};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_sync.sql"),
+    include_str!("migrations/003_sync_repairs.sql"),
 ];
 
 /// Brings the schema up to date, tracking progress in `user_version`. Refuses a
@@ -30,6 +32,9 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
     for (sql, version) in MIGRATIONS.iter().zip(1_u32..) {
         if version > applied {
             tx.execute_batch(sql)?;
+            if version == 3 {
+                Store::new(&tx, &device_id(&tx)?).settle()?;
+            }
             tx.pragma_update(None, "user_version", version)?;
         }
     }
@@ -50,103 +55,6 @@ pub(crate) fn device_id(db: &Connection) -> Result<String> {
     let id = Uuid::now_v7().to_string();
     db.execute("INSERT INTO meta (key, value) VALUES ('device', ?1)", [&id])?;
     Ok(id)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Kind {
-    Tag,
-    Session,
-    Settings,
-}
-
-impl fmt::Display for Kind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Tag => "tag",
-            Self::Session => "session",
-            Self::Settings => "settings",
-        })
-    }
-}
-
-impl FromStr for Kind {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "tag" => Ok(Self::Tag),
-            "session" => Ok(Self::Session),
-            "settings" => Ok(Self::Settings),
-            _ => Err(Error::Sync(format!("unknown kind: {value}"))),
-        }
-    }
-}
-
-impl rusqlite::ToSql for Kind {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        Ok(self.to_string().into())
-    }
-}
-
-/// A kind of record kept in the `records` table.
-pub(crate) trait Stored: Serialize + DeserializeOwned {
-    const KIND: Kind;
-
-    fn key(&self) -> String;
-
-    /// Lookup columns; only sessions have any.
-    fn index(&self) -> Index {
-        Index::default()
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct Index {
-    day: Option<String>,
-    span_start: Option<i64>,
-    span_end: Option<i64>,
-    is_open: Option<bool>,
-}
-
-impl Stored for Tag {
-    const KIND: Kind = Kind::Tag;
-
-    fn key(&self) -> String {
-        self.id.to_string()
-    }
-}
-
-impl Stored for Session {
-    const KIND: Kind = Kind::Session;
-
-    fn key(&self) -> String {
-        self.id.to_string()
-    }
-
-    fn index(&self) -> Index {
-        let segments = self.segments();
-        Index {
-            day: Some(self.day.to_string()),
-            span_start: segments.first().map(|s| s.start.as_second()),
-            span_end: segments
-                .last()
-                .and_then(|s| s.end)
-                .map(Timestamp::as_second),
-            is_open: Some(self.status() != Status::Stopped),
-        }
-    }
-}
-
-/// The key of the single settings record.
-pub(crate) const SETTINGS: &str = "settings";
-
-impl Stored for Settings {
-    const KIND: Kind = Kind::Settings;
-
-    fn key(&self) -> String {
-        SETTINGS.to_owned()
-    }
 }
 
 /// Reads and writes records on one connection or transaction.
@@ -191,6 +99,14 @@ impl<'a> Store<'a> {
         self.query(sql, [])
     }
 
+    /// Persist duplicate timer repairs during migration 003 and each import transaction.
+    pub fn settle(&self) -> Result<()> {
+        for session in Timers::load(self.open_sessions()?).1 {
+            self.put(&session)?;
+        }
+        Ok(())
+    }
+
     /// Sessions that may log time within `range`: open ones, ones belonging to
     /// a day in the range, and ones whose segments overlap it.
     pub fn sessions_in(&self, range: DateRange, tz: &TimeZone) -> Result<Vec<Session>> {
@@ -230,15 +146,26 @@ impl<'a> Store<'a> {
             .prepare_cached("SELECT rev FROM conflicts WHERE record = ?1 ORDER BY rev")?
             .query_map([key], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let merges = serde_json::to_string(&merges)?;
+        let merge_json = serde_json::to_string(&merges)?;
         self.db
             .prepare_cached(
                 "INSERT INTO changes (rev, record, kind, parent, device, body, merges)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
-            .execute(params![rev, key, kind, parent, self.device, body, merges])?;
-        replace(self.db, kind, key, &rev, body, index)?;
-        crate::sync::merge(self.db, key)?;
+            .execute(params![
+                rev,
+                key,
+                kind,
+                parent,
+                self.device,
+                body,
+                merge_json
+            ])?;
+        revisions::replace(self.db, kind, key, &rev, body, index)?;
+        // The new revision supersedes every head, so it is the only one left.
+        self.db
+            .prepare_cached("DELETE FROM conflicts WHERE record = ?1")?
+            .execute([key])?;
         Ok(())
     }
 
@@ -250,35 +177,6 @@ impl<'a> Store<'a> {
             .map(|body| Ok(serde_json::from_str(&body?)?))
             .collect()
     }
-}
-
-pub(crate) fn replace(
-    db: &Connection,
-    kind: Kind,
-    key: &str,
-    rev: &str,
-    body: Option<&str>,
-    index: &Index,
-) -> Result<()> {
-    db.prepare_cached(
-        "INSERT INTO records (id, kind, rev, body, day, span_start, span_end, is_open)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT (id) DO UPDATE SET
-                    rev = excluded.rev, body = excluded.body, day = excluded.day,
-                    span_start = excluded.span_start, span_end = excluded.span_end,
-                    is_open = excluded.is_open",
-    )?
-    .execute(params![
-        key,
-        kind,
-        rev,
-        body,
-        index.day,
-        index.span_start,
-        index.span_end,
-        index.is_open
-    ])?;
-    Ok(())
 }
 
 /// Advance the timestamp if the wall clock stepped back, preserving `UUIDv7` bits.
@@ -301,6 +199,7 @@ fn next_revision(candidate: Uuid, latest: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tinytrac_core::Tag;
 
     fn database() -> Connection {
         let mut db = Connection::open_in_memory().unwrap();
@@ -381,5 +280,44 @@ mod tests {
         assert_eq!(changes[2].1.as_ref(), Some(&changes[1].0));
         assert!(changes[2].2, "deletion leaves a tombstone");
         assert!(store.get::<Tag>(&tag.key()).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_three_preserves_history_and_reinspects_old_files() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(include_str!("migrations/001_initial.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("migrations/002_sync.sql"))
+            .unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+        db.execute_batch("INSERT INTO imported_files (name) VALUES ('future.json');
+            INSERT INTO changes (rev, record, kind, device) VALUES ('root', 'id', 'tag', 'device');
+            INSERT INTO changes (rev, record, kind, device, parent) VALUES ('child', 'id', 'tag', 'device', 'root');").unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM changes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM imported_files", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(revisions::heads(&db, "id").unwrap(), ["child"]);
+        db.execute(
+            "INSERT INTO imported_files (name, rejected, reason) VALUES ('bad', 1, 'bad JSON')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT rejected FROM imported_files", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

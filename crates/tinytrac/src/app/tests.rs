@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use iced::{Theme, keyboard::Modifiers};
 use iced_test::{Error, Simulator};
 use jiff::{SignedDuration, Zoned};
-use tinytrac_engine::Engine;
+use tinytrac_engine::{Engine, SyncRun};
 
 use super::{App, Message, Screen};
 use crate::screen::{history, reports, settings, timers};
@@ -336,4 +336,126 @@ fn tray_ids_without_a_tray_are_ignored() {
     }
     assert!(!h.app.data.any_running());
     assert!(h.app.window.is_none());
+}
+
+#[test]
+fn custom_report_accepts_the_last_civil_date() {
+    let mut h = Harness::new();
+    h.send(Message::Show(Screen::Reports));
+    h.send(Message::Reports(reports::Message::Preset(
+        reports::Preset::Custom,
+    )));
+    h.send(Message::Reports(reports::Message::From(
+        "9999-12-31".into(),
+    )));
+    h.send(Message::Reports(reports::Message::To("9999-12-31".into())));
+    h.send(Message::Reports(reports::Message::ApplyCustom));
+    assert!(h.shows("9999-12-31"));
+}
+
+#[test]
+fn dismissed_sync_problems_only_reappear_for_new_problems() {
+    let mut h = Harness::new();
+    let report = SyncRun::default();
+    let _ = h.app.update(Message::Synced(Err("unavailable".into())));
+    assert!(h.app.error.is_some());
+    h.send(Message::DismissError);
+    h.send(Message::Synced(Err("unavailable".into())));
+    let _ = h
+        .app
+        .update(Message::Synced(Err("different failure".into())));
+    assert!(h.app.error.is_some());
+    h.send(Message::DismissError);
+    h.send(Message::Synced(Ok(report)));
+}
+
+#[test]
+fn old_rejections_do_not_raise_a_banner_after_launch() {
+    let directory = std::env::temp_dir().join(format!(
+        "tinytrac-rejections-{}",
+        tinytrac_core::TagId::generate()
+    ));
+    let folder = directory.join("sync");
+    let peer = folder.join("peer");
+    std::fs::create_dir_all(&peer).unwrap();
+    let mut engine = Engine::open(directory.join("db")).unwrap();
+    engine.set_sync_folder(&folder).unwrap();
+    std::fs::write(peer.join("bad.json"), "bad JSON").unwrap();
+    engine.sync().unwrap();
+    let mut app = App::new(engine).unwrap();
+    assert_eq!(app.sync.problems.rejected, 1);
+    let _ = app.update(Message::Synced(Ok(SyncRun::default())));
+    assert!(app.error.is_none());
+    std::fs::write(peer.join("new.json"), "bad JSON").unwrap();
+    let run = app.engine.sync().unwrap();
+    let _ = app.update(Message::Synced(Ok(run)));
+    assert_eq!(app.error.as_deref(), Some("1 new change was rejected"));
+    assert!(!app.sync.status.contains("rejected"));
+    assert!(app.sync.status.starts_with("Synced at "));
+    assert!(app.sync.status.ends_with(": 0 exported, 0 imported"));
+    let _ = app.update(Message::DismissError);
+    let _ = app.update(Message::Synced(Ok(SyncRun::default())));
+    assert!(app.error.is_none());
+    let _ = app.update(Message::Synced(Err("unavailable".into())));
+    assert!(app.sync.status.starts_with("Sync failed at "));
+    assert!(app.sync.status.ends_with(": unavailable"));
+    assert_eq!(app.error.as_deref(), Some("unavailable"));
+    app.engine.clear_sync_folder().unwrap();
+    let _ = app.update(Message::Synced(Ok(SyncRun::default())));
+    assert_eq!(app.sync.status, "Sync disabled");
+    drop(app);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sync_requests_coalesce_and_only_successful_commands_request_sync() {
+    let directory = std::env::temp_dir().join(format!(
+        "tinytrac-app-test-{}",
+        tinytrac_core::TagId::generate()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let mut app = App::new(Engine::open(directory.join("db")).unwrap()).unwrap();
+    assert_eq!(app.update(Message::Refresh).units(), 1);
+    assert!(app.sync.syncing);
+    for _ in 0..3 {
+        assert_eq!(app.update(Message::Refresh).units(), 0);
+    }
+    assert!(app.sync.queued);
+    // Headless tasks are not polled; deliver their completions explicitly.
+    assert_eq!(
+        app.update(Message::Synced(Ok(SyncRun::default()))).units(),
+        1
+    );
+    assert!(app.sync.syncing);
+    assert!(!app.sync.queued);
+    assert_eq!(
+        app.update(Message::Synced(Ok(SyncRun::default()))).units(),
+        0
+    );
+    assert!(!app.sync.syncing);
+    assert_eq!(
+        app.update(Message::Timers(timers::Message::Pause(
+            tinytrac_core::TagId::generate()
+        )))
+        .units(),
+        0
+    );
+    assert!(app.error.is_some());
+    assert!(!app.sync.syncing);
+    let _ = app.update(Message::Timers(timers::Message::NewTagChanged(
+        "Saved".into(),
+    )));
+    assert_eq!(
+        app.update(Message::Timers(timers::Message::CreateTag))
+            .units(),
+        1
+    );
+    assert!(app.sync.syncing);
+    drop(app);
+    std::fs::remove_dir_all(directory).unwrap();
+
+    let mut h = Harness::new();
+    h.create_tag("In memory");
+    assert_eq!(h.app.update(Message::Refresh).units(), 0);
+    assert!(!h.app.sync.syncing);
 }

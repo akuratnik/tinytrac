@@ -53,15 +53,19 @@ impl Tray {
 
     pub fn refresh(&mut self, data: &Data) -> Result<()> {
         let model = Model::new(data);
+        let previous = std::mem::replace(&mut self.model, model);
+        let model = &self.model;
         if let Some(native) = &self.icon {
-            let menu = menu(&model)?;
-            native.set_tooltip(Some(&model.tooltip))?;
-            if model.running != self.model.running {
+            if !model.same_menu(&previous) {
+                native.set_menu(Some(Box::new(menu(model)?)));
+            }
+            if model.tooltip != previous.tooltip {
+                native.set_tooltip(Some(&model.tooltip))?;
+            }
+            if model.running != previous.running {
                 native.set_icon(Some(icon(model.running)?))?;
             }
-            native.set_menu(Some(Box::new(menu)));
         }
-        self.model = model;
         Ok(())
     }
 

@@ -98,11 +98,9 @@ impl Engine {
 
     // Timers
 
-    /// The open timers. Duplicates that sync may bring in show as one and are
-    /// resolved by the next timer command; see [`Timers::load`].
+    /// The open timers. Duplicate sessions are settled during migration 003 and import.
     pub fn timers(&self) -> Result<Timers> {
-        let now = self.now().timestamp();
-        Ok(Timers::load(self.read(Store::open_sessions)?, now).0)
+        Ok(Timers::load(self.read(Store::open_sessions)?).0)
     }
 
     /// Starts or resumes `tag`'s timer; see [`Timers::start`].
@@ -235,20 +233,39 @@ impl Engine {
         let value = path
             .to_str()
             .ok_or_else(|| Error::Sync("sync folder must be UTF-8".into()))?;
-        self.db.execute("INSERT INTO meta (key, value) VALUES ('sync_folder', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [value])?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'sync_folder'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() != Some(value) {
+            tx.execute("INSERT INTO meta (key, value) VALUES ('sync_folder', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [value])?;
+            tx.execute_batch("UPDATE changes SET exported = 0; DELETE FROM imported_files; UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'sync_epoch';")?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn clear_sync_folder(&mut self) -> Result<()> {
-        self.db
-            .execute("DELETE FROM meta WHERE key = 'sync_folder'", [])?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("DELETE FROM meta WHERE key = 'sync_folder'; UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'sync_epoch';")?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Publishes local changes before importing other devices' immutable batches.
-    pub fn sync(&mut self) -> Result<crate::SyncReport> {
-        let Some(root) = self.sync_folder()? else {
-            return Ok(crate::SyncReport::default());
+    /// Publishes pending revisions before importing other devices' immutable batches.
+    pub fn sync(&mut self) -> Result<crate::SyncRun> {
+        let (root, epoch) =
+            self.snapshot(|engine| Ok((engine.sync_folder()?, crate::sync::epoch(&engine.db)?)))?;
+        let Some(root) = root else {
+            return Ok(crate::SyncRun::default());
         };
         let root = std::fs::canonicalize(root)?;
         self.check_sync_folder(&root)?;
@@ -256,7 +273,12 @@ impl Engine {
             root,
             device: self.device.clone(),
         };
-        crate::sync::run(&mut self.db, &self.device, &folder)
+        crate::sync::run(&mut self.db, &self.device, epoch, &folder)
+    }
+
+    /// Durable rejections and current conflicts, even when sync is disabled.
+    pub fn sync_diagnostics(&self) -> Result<crate::SyncDiagnostics> {
+        crate::sync::diagnostics(&self.db)
     }
 
     fn check_sync_folder(&self, folder: &Path) -> Result<()> {
@@ -269,6 +291,22 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The file backing this engine, or `None` for an in-memory database.
+    pub fn path(&self) -> Option<&Path> {
+        self.db
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(Path::new)
+    }
+
+    /// Runs related reads in one consistent deferred transaction.
+    pub fn snapshot<T>(&self, read: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let tx = self.db.unchecked_transaction()?;
+        let result = read(self)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     // Helpers
@@ -296,7 +334,7 @@ impl Engine {
     ) -> Result<Vec<Session>> {
         let now = self.now();
         self.write(|store| {
-            let (mut timers, mut changed) = Timers::load(store.open_sessions()?, now.timestamp());
+            let (mut timers, mut changed) = Timers::load(store.open_sessions()?);
             changed.extend(action(&mut timers, store, &now)?);
             for session in &changed {
                 store.put(session)?;
@@ -341,7 +379,7 @@ pub struct SessionEdit {
     pub logged: Option<SignedDuration>,
 }
 
-/// Tag names are unique, ignoring case, so reports never show two alike.
+/// Names are unique when created or renamed locally; sync may bring duplicates.
 fn ensure_unique_name(store: &Store, tag: &Tag) -> Result<()> {
     let name = tag.name().to_lowercase();
     let taken = store
@@ -396,5 +434,80 @@ mod tests {
         assert_eq!(changed.len(), 2, "the duplicate stopped, the other paused");
         assert_eq!(revisions(&engine) - before, 2, "one revision per change");
         assert_eq!(engine.read(Store::open_sessions).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_repairs_old_duplicates_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(include_str!("migrations/001_initial.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("migrations/002_sync.sql"))
+            .unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+        let tag = TagId::generate();
+        for _ in 0..2 {
+            let session = Session::start(tag, None, &Zoned::now());
+            let rev = uuid::Uuid::now_v7().to_string();
+            let body = serde_json::to_string(&session).unwrap();
+            db.execute("INSERT INTO changes (rev, record, kind, device, body) VALUES (?1, ?2, 'session', 'old', ?3)", rusqlite::params![rev, session.id.to_string(), body]).unwrap();
+            db.execute("INSERT INTO records (id, kind, rev, body, is_open) VALUES (?1, 'session', ?2, ?3, 1)", rusqlite::params![session.id.to_string(), rev, body]).unwrap();
+        }
+        drop(db);
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(engine.read(Store::open_sessions).unwrap().len(), 1);
+        let count = |engine: &Engine| {
+            engine
+                .db
+                .query_row("SELECT count(*) FROM changes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let before = count(&engine);
+        assert_eq!(before, 3);
+        assert_eq!(count(&Engine::open(&path).unwrap()), before);
+    }
+
+    #[test]
+    fn opening_a_current_database_does_not_repair_or_need_a_write_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let mut engine = Engine::open(&path).unwrap();
+        let tag = engine.create_tag("Duplicate").unwrap().id;
+        let now = engine.now();
+        engine
+            .write(|store| {
+                store.put(&Session::start(tag, None, &now))?;
+                store.put(&Session::start(tag, None, &now))
+            })
+            .unwrap();
+        let _writer = engine
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.read(Store::open_sessions).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_reads_stay_consistent_while_another_connection_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db");
+        let mut engine = Engine::open(&path).unwrap();
+        let mut other = Engine::open(&path).unwrap();
+        engine.create_tag("First").unwrap();
+        engine
+            .snapshot(|snapshot| {
+                assert_eq!(snapshot.tags()?.len(), 1);
+                other.create_tag("Second")?;
+                assert_eq!(snapshot.tags()?.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(engine.tags().unwrap().len(), 2);
+        assert!(Engine::open_in_memory().unwrap().path().is_none());
+        assert_eq!(engine.path(), Some(path.as_path()));
     }
 }

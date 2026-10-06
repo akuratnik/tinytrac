@@ -2,8 +2,9 @@
 //! shared data after every command.
 
 mod lifecycle;
+mod sync;
 
-use std::{fmt::Write, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use iced::{
     Alignment::Center,
@@ -12,7 +13,7 @@ use iced::{
     window,
 };
 use tinytrac_core::DateRange;
-use tinytrac_engine::Engine;
+use tinytrac_engine::{Engine, SyncRun};
 
 use crate::{
     data::Data,
@@ -37,6 +38,7 @@ pub enum Message {
     TrayMenu(String),
     TrayHost(bool),
     Refresh,
+    Synced(Result<SyncRun, String>),
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
     DismissError,
@@ -51,11 +53,11 @@ pub struct App {
     window: Option<window::Id>,
     tray: Option<tray::Tray>,
     engine: Engine,
+    sync: sync::State,
     data: Data,
     screen: Screen,
     modifiers: keyboard::Modifiers,
     error: Option<String>,
-    sync_status: String,
     timers: timers::State,
     history: history::State,
     reports: reports::State,
@@ -67,17 +69,18 @@ impl App {
         let data = Data::load(&engine)?;
         let mut reports = reports::State::new(&data);
         reports.reload(&engine, &data)?;
+        let sync = sync::State::new(&engine, &data)?;
         Ok(Self {
             window: None,
             tray: None,
             settings: settings::State::new(&data),
             reports,
             engine,
+            sync,
             data,
             screen: Screen::Track,
             modifiers: keyboard::Modifiers::default(),
             error: None,
-            sync_status: String::new(),
             timers: timers::State::default(),
             history: history::State::default(),
         })
@@ -92,7 +95,7 @@ impl App {
                 eprintln!("tinytrac: cannot open {}: {error}", path.display());
                 std::process::exit(1);
             });
-        let task = app.open_window();
+        let task = Task::batch([app.open_window(), app.sync.request()]);
         (app, task)
     }
 
@@ -109,10 +112,10 @@ impl App {
             Ok(Outcome::Saved) => {
                 self.error = None;
                 self.refresh();
+                return self.sync.request();
             }
             Err(error) => {
                 self.error = Some(error.to_string());
-                // A failed command may still have changed something.
                 self.refresh();
             }
         }
@@ -131,43 +134,6 @@ impl App {
 
     /// Reloads the data, e.g. after a command or to pick up changes made elsewhere.
     fn refresh(&mut self) {
-        self.sync_status = match self.engine.sync() {
-            Ok(report) => {
-                let mut status = if self.engine.sync_folder().ok().flatten().is_none() {
-                    "Sync disabled".to_owned()
-                } else {
-                    format!(
-                        "{}: {} exported, {} imported",
-                        self.engine.now().time().strftime("%H:%M:%S"),
-                        report.exported,
-                        report.imported
-                    )
-                };
-                if let Some(issue) = report.skipped.last() {
-                    let _ = write!(
-                        status,
-                        "; {} skipped: {}: {}",
-                        report.skipped.len(),
-                        issue.file.as_deref().unwrap_or("sync"),
-                        issue.reason
-                    );
-                }
-                if report.conflicts > 0 {
-                    let _ = write!(
-                        status,
-                        "; {} {} made on two devices at once; the newer one was kept.",
-                        report.conflicts,
-                        if report.conflicts == 1 {
-                            "edit"
-                        } else {
-                            "edits"
-                        }
-                    );
-                }
-                status
-            }
-            Err(error) => format!("{}: {error}", self.engine.now().time().strftime("%H:%M:%S")),
-        };
         let reloaded = Data::load(&self.engine).and_then(|data| {
             self.data = data;
             if let Some(tray) = &mut self.tray
@@ -222,7 +188,7 @@ impl App {
             Screen::Reports => self.reports.view(&self.data).map(Message::Reports),
             Screen::Settings => self
                 .settings
-                .view(&self.data, &self.sync_status)
+                .view(&self.data, &self.sync.status)
                 .map(Message::Settings),
         };
 

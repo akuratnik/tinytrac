@@ -139,14 +139,38 @@ fn concurrent_heads_converge_and_conflicts_are_not_duplicated() {
     pair.exchange();
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
     assert_eq!(pair.b.tags().unwrap()[0].name(), "Laptop");
-    assert_eq!(pair.a.sync().unwrap().conflicts, 1);
-    assert_eq!(pair.b.sync().unwrap().conflicts, 1);
+    assert_eq!(
+        {
+            pair.a.sync().unwrap();
+            pair.a.sync_diagnostics().unwrap().conflicts
+        },
+        1
+    );
+    assert_eq!(
+        {
+            pair.b.sync().unwrap();
+            pair.b.sync_diagnostics().unwrap().conflicts
+        },
+        1
+    );
     assert_eq!(pair.count("a", "conflicts"), 1);
     pair.a.rename_tag(tag.id, "Later").unwrap();
     pair.exchange();
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
-    assert_eq!(pair.a.sync().unwrap().conflicts, 0);
-    assert_eq!(pair.b.sync().unwrap().conflicts, 0);
+    assert_eq!(
+        {
+            pair.a.sync().unwrap();
+            pair.a.sync_diagnostics().unwrap().conflicts
+        },
+        0
+    );
+    assert_eq!(
+        {
+            pair.b.sync().unwrap();
+            pair.b.sync_diagnostics().unwrap().conflicts
+        },
+        0
+    );
 }
 
 #[test]
@@ -163,7 +187,13 @@ fn late_ancestors_do_not_replace_their_descendants() {
     fs::write(&old, bytes).unwrap();
     assert_eq!(pair.b.sync().unwrap().imported, 1);
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
-    assert_eq!(pair.b.sync().unwrap().conflicts, 0);
+    assert_eq!(
+        {
+            pair.b.sync().unwrap();
+            pair.b.sync_diagnostics().unwrap().conflicts
+        },
+        0
+    );
 }
 
 #[test]
@@ -183,8 +213,15 @@ fn corrupt_files_and_invalid_changes_are_reported_once() {
     fs::write(path.with_file_name("ignored.tmp"), b"not JSON").unwrap();
     let report = pair.b.sync().unwrap();
     assert_eq!(report.imported, 1);
-    assert_eq!(report.skipped.len(), 2);
-    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    let diagnostics = pair.b.sync_diagnostics().unwrap();
+    assert_eq!(diagnostics.rejected, 2);
+    let later = pair.b.sync().unwrap();
+    assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 2);
+    assert_eq!(
+        pair.b.sync_diagnostics().unwrap().reason,
+        diagnostics.reason
+    );
+    assert!(later.skipped.is_empty());
     fs::write(&corrupt, &good).unwrap();
     fs::write(&invalid, &good).unwrap();
     assert!(pair.b.sync().unwrap().skipped.is_empty());
@@ -204,9 +241,36 @@ fn timers_can_move_between_devices_and_offline_duplicates_are_settled() {
     assert!(pair.a.timers().unwrap().get(tag).is_none());
     pair.a.start(tag, StartMode::Exclusive).unwrap();
     pair.b.start(tag, StartMode::Exclusive).unwrap();
-    pair.exchange();
+    *pair.clock.lock().unwrap() = "2026-10-01T10:10[UTC]".parse().unwrap();
     pair.b.pause_all().unwrap();
     pair.exchange();
+    *pair.clock.lock().unwrap() = "2026-10-01T12:00[UTC]".parse().unwrap();
+    assert_eq!(
+        pair.a.totals(today()).unwrap(),
+        pair.b.totals(today()).unwrap()
+    );
+    assert_eq!(
+        pair.a.totals(today()).unwrap().total(),
+        SignedDuration::from_mins(190)
+    );
+    assert!(matches!(
+        pair.a.timers().unwrap().get(tag).unwrap().status(),
+        Status::Running(_)
+    ));
+    assert_eq!(
+        {
+            pair.a.sync().unwrap();
+            pair.a.sync_diagnostics().unwrap().conflicts
+        },
+        0
+    );
+    assert_eq!(
+        {
+            pair.b.sync().unwrap();
+            pair.b.sync_diagnostics().unwrap().conflicts
+        },
+        0
+    );
     for engine in [&pair.a, &pair.b] {
         assert_eq!(
             engine
@@ -314,7 +378,7 @@ fn invalid_ids_kinds_and_bodies_do_not_prevent_valid_siblings() {
         serde_json::json!({"version": 1, "changes": [mismatch, changed_kind, unknown, valid]});
     fs::write(path, serde_json::to_vec(&batch).unwrap()).unwrap();
     let report = pair.b.sync().unwrap();
-    assert_eq!(report.skipped.len(), 3);
+    assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 3);
     assert_eq!(report.imported, 1);
     assert_eq!(pair.b.tags().unwrap()[0].name(), "Accepted sibling");
     assert_eq!(pair.b.sync().unwrap().imported, 0);
@@ -470,7 +534,7 @@ fn randomized_three_device_exchange_converges() {
 }
 
 #[test]
-fn validation_after_insert_rolls_back_only_that_change() {
+fn a_headless_graph_rejects_its_whole_file_but_valid_files_import() {
     let mut pair = Pair::new();
     pair.a.create_tag("Template").unwrap();
     pair.a.sync().unwrap();
@@ -489,12 +553,240 @@ fn validation_after_insert_rolls_back_only_that_change() {
     first["merges"] = serde_json::json!([b]);
     second["rev"] = b.clone().into();
     second["parent"] = a.into();
+    fs::write(
+        path.with_file_name("valid.json"),
+        serde_json::to_vec(&batch).unwrap(),
+    )
+    .unwrap();
     let valid = batch["changes"][0].clone();
     batch["changes"] = serde_json::json!([first, second, valid]);
     fs::write(&path, serde_json::to_vec(&batch).unwrap()).unwrap();
     let report = pair.b.sync().unwrap();
-    assert_eq!(report.imported, 2);
-    assert_eq!(report.skipped.len(), 1);
-    assert_eq!(pair.count("b", "changes"), 2);
+    assert_eq!(report.imported, 1);
+    assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 1);
+    assert_eq!(pair.count("b", "changes"), 1);
     assert!(pair.b.sync().unwrap().skipped.is_empty());
+}
+
+#[test]
+#[ignore = "release-mode import benchmark"]
+fn import_two_thousand_pause_resume_cycles() {
+    let mut pair = Pair::new();
+    let tag = pair.a.create_tag("Benchmark").unwrap().id;
+    pair.a.start(tag, StartMode::Exclusive).unwrap();
+    for _ in 0..2000 {
+        pair.a.pause(tag).unwrap();
+        pair.a.start(tag, StartMode::Exclusive).unwrap();
+    }
+    pair.a.sync().unwrap();
+    let start = std::time::Instant::now();
+    let report = pair.b.sync().unwrap();
+    let elapsed = start.elapsed();
+    eprintln!(
+        "2000 pause/resume cycles: {elapsed:?} ({} revisions)",
+        report.imported
+    );
+    assert_eq!(report.imported, 4002);
+    assert!(report.skipped.is_empty());
+    assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 0);
+    assert_eq!(
+        pair.a.sessions(today()).unwrap(),
+        pair.b.sessions(today()).unwrap()
+    );
+}
+
+#[test]
+fn switching_folders_republishes_foreign_revisions_and_tombstones() {
+    let mut pair = Pair::new();
+    let tag = pair.b.create_tag("From another device").unwrap();
+    let entry = pair
+        .b
+        .add_entry(tag.id, date(2026, 10, 1), SignedDuration::from_mins(1))
+        .unwrap();
+    pair.exchange();
+    pair.b.delete_session(entry.id).unwrap();
+    pair.exchange();
+    pair.a.set_sync_folder(&pair.folder).unwrap();
+    assert_eq!(pair.a.sync().unwrap().exported, 0);
+    let fresh = pair.root.path().join("fresh");
+    pair.a.set_sync_folder(&fresh).unwrap();
+    let expected = usize::try_from(pair.count("a", "changes")).unwrap();
+    assert_eq!(pair.a.sync().unwrap().exported, expected);
+    let mut peer = Engine::open(pair.root.path().join("fresh.db")).unwrap();
+    peer.set_sync_folder(&fresh).unwrap();
+    assert_eq!(peer.sync().unwrap().imported, expected);
+    assert_eq!(peer.tags().unwrap(), pair.a.tags().unwrap());
+    assert!(peer.sessions(today()).unwrap().is_empty());
+    pair.a.clear_sync_folder().unwrap();
+    pair.a.set_sync_folder(&fresh).unwrap();
+    assert_eq!(pair.a.sync().unwrap().exported, expected);
+    assert_eq!(peer.sync().unwrap().imported, 0);
+}
+
+#[test]
+fn newer_versions_remain_retryable_and_do_not_block_other_files() {
+    let mut pair = Pair::new();
+    pair.a.create_tag("Readable").unwrap();
+    pair.a.sync().unwrap();
+    let file = pair.files()[0].with_file_name("future.json");
+    fs::write(&file, br#"{"version":2,"changes":{"new-format":true}}"#).unwrap();
+    for expected in [1, 0] {
+        let report = pair.b.sync().unwrap();
+        assert_eq!(report.imported, expected);
+        assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 0);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].reason.contains("update this device"));
+        assert_eq!(pair.count("b", "imported_files"), 1);
+    }
+    fs::write(file, br#"{"version":1,"changes":[]}"#).unwrap();
+    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    assert_eq!(pair.count("b", "imported_files"), 2);
+}
+
+#[test]
+fn rejections_remain_visible_after_reopen_and_when_sync_is_disabled() {
+    let mut pair = Pair::new();
+    pair.a.create_tag("Valid").unwrap();
+    pair.a.sync().unwrap();
+    fs::write(pair.files()[0].with_file_name("bad.json"), b"invalid JSON").unwrap();
+    pair.b.sync().unwrap();
+    let first = pair.b.sync_diagnostics().unwrap();
+    assert_eq!(first.rejected, 1);
+    assert!(first.reason.is_some());
+    let mut reopened = Engine::open(pair.root.path().join("b.db")).unwrap();
+    reopened.clear_sync_folder().unwrap();
+    assert!(reopened.sync().unwrap().skipped.is_empty());
+    let later = reopened.sync_diagnostics().unwrap();
+    assert_eq!(later.rejected, first.rejected);
+    assert_eq!(later.reason, first.reason);
+}
+
+#[test]
+fn partial_three_device_repairs_converge_without_further_revisions() {
+    let mut pair = Pair::new();
+    let tag = pair.a.create_tag("Offline").unwrap().id;
+    pair.exchange();
+    let mut c = Engine::open(pair.root.path().join("c.db")).unwrap();
+    c.set_sync_folder(&pair.folder).unwrap();
+    c.sync().unwrap();
+    for (engine, time) in [
+        (&mut pair.a, "09:00"),
+        (&mut pair.b, "09:05"),
+        (&mut c, "09:10"),
+    ] {
+        let now: Zoned = format!("2026-10-01T{time}[UTC]").parse().unwrap();
+        engine.set_clock(move || now.clone());
+        engine.start(tag, StartMode::Exclusive).unwrap();
+    }
+    c.pause_all().unwrap();
+    // B repairs with only A known; C sees both. Repair clocks differ wildly.
+    for (engine, day) in [(&mut pair.a, "02"), (&mut pair.b, "03"), (&mut c, "04")] {
+        let now: Zoned = format!("2026-10-{day}T12:00[UTC]").parse().unwrap();
+        engine.set_clock(move || now.clone());
+        engine.sync().unwrap();
+    }
+    for _ in 0..4 {
+        pair.exchange();
+        c.sync().unwrap();
+    }
+    let records = |device: &str| {
+        let db = Connection::open(pair.root.path().join(format!("{device}.db"))).unwrap();
+        db.prepare("SELECT id, rev, body FROM records ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(records("a"), records("b"));
+    assert_eq!(records("a"), records("c"));
+    for engine in [&pair.a, &pair.b, &c] {
+        assert_eq!(
+            engine
+                .sessions(today())
+                .unwrap()
+                .iter()
+                .filter(|s| s.status() != Status::Stopped)
+                .count(),
+            engine.timers().unwrap().iter().count()
+        );
+    }
+    let before = [
+        pair.count("a", "changes"),
+        pair.count("b", "changes"),
+        pair.count("c", "changes"),
+    ];
+    for engine in [&mut pair.a, &mut pair.b, &mut c] {
+        let report = engine.sync().unwrap();
+        assert_eq!((report.imported, report.exported), (0, 0));
+    }
+    assert_eq!(
+        before,
+        [
+            pair.count("a", "changes"),
+            pair.count("b", "changes"),
+            pair.count("c", "changes")
+        ]
+    );
+}
+
+#[test]
+fn kind_validation_uses_unmaterialized_history() {
+    let mut pair = Pair::new();
+    pair.a.create_tag("New record").unwrap();
+    pair.a.sync().unwrap();
+    let file = pair.files()[0].clone();
+    let mut batch: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let mut wrong_kind = batch["changes"][0].clone();
+    wrong_kind["rev"] = uuid::Uuid::now_v7().to_string().into();
+    wrong_kind["kind"] = "session".into();
+    wrong_kind["body"] = serde_json::Value::Null;
+    batch["changes"].as_array_mut().unwrap().push(wrong_kind);
+    fs::write(file, serde_json::to_vec(&batch).unwrap()).unwrap();
+    let report = pair.b.sync().unwrap();
+    assert_eq!(
+        (report.imported, pair.b.sync_diagnostics().unwrap().rejected),
+        (1, 1)
+    );
+    assert!(
+        pair.b
+            .sync_diagnostics()
+            .unwrap()
+            .reason
+            .unwrap()
+            .contains("record changed kind")
+    );
+    assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
+}
+
+#[test]
+fn identical_heads_are_hidden_in_counts_but_merged_by_the_next_write() {
+    let mut pair = Pair::new();
+    let tag = pair.a.create_tag("Original").unwrap().id;
+    pair.exchange();
+    pair.a.rename_tag(tag, "Identical").unwrap();
+    pair.b.rename_tag(tag, "Identical").unwrap();
+    pair.exchange();
+    for engine in [&mut pair.a, &mut pair.b] {
+        assert_eq!(
+            {
+                engine.sync().unwrap();
+                engine.sync_diagnostics().unwrap().conflicts
+            },
+            0
+        );
+    }
+    assert_eq!(pair.count("a", "conflicts"), 1);
+    assert_eq!(pair.count("b", "conflicts"), 1);
+    pair.a.rename_tag(tag, "Resolved").unwrap();
+    pair.exchange();
+    assert_eq!(pair.count("a", "conflicts"), 0);
+    assert_eq!(pair.count("b", "conflicts"), 0);
+    assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
 }

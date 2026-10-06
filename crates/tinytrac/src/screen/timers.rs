@@ -137,7 +137,7 @@ fn tag_row<'a>(
     let running = timer.is_some_and(|session| matches!(session.status(), Status::Running(_)));
     container(
         column![
-            row![text(tag.name()).width(Fill)]
+            row![text(data.tag_name(tag.id).to_owned()).width(Fill)]
                 .push(clock)
                 .align_y(Center),
             row![muted(info).width(Fill), controls].align_y(Center),

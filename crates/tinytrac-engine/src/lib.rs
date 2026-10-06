@@ -7,6 +7,7 @@
 
 mod engine;
 mod error;
+mod revisions;
 mod settings;
 mod store;
 
@@ -16,4 +17,4 @@ pub use settings::{Settings, WeekStart};
 
 mod sync;
 mod transport;
-pub use sync::{SyncIssue, SyncReport};
+pub use sync::{SyncDiagnostics, SyncIssue, SyncRun};

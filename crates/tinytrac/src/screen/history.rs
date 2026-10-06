@@ -220,7 +220,7 @@ impl Form {
             .filter(|tag| !tag.archived || Some(tag.id) == self.tag)
             .map(|tag| TagChoice {
                 id: tag.id,
-                name: tag.name().to_owned(),
+                name: data.tag_name(tag.id).to_owned(),
             })
             .collect();
         let selected = choices.iter().find(|c| Some(c.id) == self.tag).cloned();

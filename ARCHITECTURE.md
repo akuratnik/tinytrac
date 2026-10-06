@@ -47,7 +47,11 @@ rules.
 (`StartMode::Alongside`). Starting a timer that is on a break ends the break. Every
 mutating call returns the sessions it changed, so the engine persists exactly
 those. If two offline devices each opened a session for the same tag, loading
-keeps the most recently active one and stops the other, keeping its time.
+ranks sessions by (is running, last state change, session id). A running session
+beats a paused one. A paused loser keeps all its time; only its stopped flag changes.
+When both are running, the later start wins and the earlier session stops there,
+like an exclusive start. A segmentless winner falls back to `Timestamp::MIN`.
+The repair uses no local clock, so identical inputs produce identical bodies.
 
 **Totals**: logged time per day and tag over a `DateRange`. Recorded time is cut at
 local midnight (DST-aware). Covered break is assigned to break segments in order. A
@@ -74,7 +78,11 @@ Storage is a small document store (`rusqlite`, bundled SQLite):
 - `meta` holds local, unsynced values such as this device's id.
 
 The schema is versioned with `PRAGMA user_version` and plain SQL migrations. A
-database from a newer version is refused rather than risk damaging it. Write
+database from a newer version is refused rather than risk damaging it. Migration
+003 adds durable rejection diagnostics, a sync epoch and lookup indexes, clears
+imported filenames once to reinspect files older clients swallowed, and runs the
+Rust duplicate repair in the migration transaction. Opening an up-to-date database
+does not write repairs. Write
 transactions take the lock up front (`BEGIN IMMEDIATE`) and wait at most two
 seconds for another writer.
 Settings (break bank on/off and ratio, week start) are a synced record.
@@ -86,12 +94,14 @@ four screens (timers, history, reports, settings). Each screen keeps its own edi
 state (form buffers; reports also caches its range's sessions) and its own
 `Message` type, and calls the engine in `update`. That returns an `Outcome`:
 `Edited` when only the screen's state changed, such as typing, and `Saved` when
-the engine wrote something. Only saves reload data and clear the error banner, so
-typing never touches the database.
+the engine wrote something. Saves reload data, clear the command error banner, and request sync. Failed commands
+reload without syncing; commands are transactional. Typing never touches the database.
 
 `Data` is a read-only snapshot of tags, open timers, settings and the last 14 days
-of sessions. It is reloaded after every save, on a new day, and every 30 seconds to
-pick up changes made elsewhere. Views compute live values, such as a running timer's
+of sessions. `Engine::snapshot` wraps its queries in one deferred read transaction.
+It is reloaded after saves, failed commands, sync completion and on a new day.
+Tag labels are disambiguated here in tag-id order, reserving existing names and
+including archived tags; suffixes are display-only. Views compute live values, such as a running timer's
 time or today's totals, from the snapshot on each one-second tick (one-minute when
 nothing runs), so they never touch the database. Forms remember the values they
 opened with and save only what the user changed. Start buttons carry their
@@ -106,8 +116,10 @@ Native tray resources are created in `update`, after the event loop has started
 (required on macOS), and stay on that thread.
 
 `tray.rs` adapts a pure menu model (`tray/model.rs`) to `tray-icon`. Menus and the
-today tooltip refresh with `Data`, not with clock ticks; the generated RGBA clock
-changes when running state changes. Native callbacks feed a channel subscription,
+today tooltip refresh with `Data`, not with clock ticks. The native menu is replaced
+only when visible ids, labels, enabled states or separators change, and the tooltip
+only when its text changes. Routing always uses the latest model. The generated
+RGBA clock changes when running state changes. Native callbacks feed a channel subscription,
 delivering one iced message per event through the screens' command and reload
 paths. On Linux, the ksni backend uses D-Bus without a GTK loop. Since it assumes
 a tray host exists, a
@@ -131,37 +143,63 @@ Create a fresh database on each device: copying a database also copies its devic
 id and must not be used to provision another writer.
 
 `transport.rs` defines three operations: publish, list, and read batches. Its only
-implementation is the folder. Merge and validation live in `sync.rs`, independent
-of the transport. Files are `<device>/<last-seq:020>-<uuidv7>.json`, containing format
-version 1 and an array of changes. Publication writes and fsyncs a temporary file
-in the same directory, renames it, and on Unix fsyncs the directories. Unique names
-allow sequence reuse after backup restore. The export transaction holds the writer lock
-until publication succeeds, then marks only its selected local changes exported.
-A crash before commit can republish revisions; revision ids make this harmless.
-Files are immutable and only a device's own changes are exported. Export errors
-are reported without preventing imports.
+implementation is the folder. `sync.rs` coordinates import/export, `store.rs`
+provides typed storage and timer repair, and `revisions.rs` owns validation,
+head computation and materialized winners. These layers share no reverse dependencies.
+Files are `<device>/<last-seq:020>-<uuidv7>.json`, containing format
+version 1 and an array of changes. **Any batch-format change bumps the version.**
+Publication writes and fsyncs a temporary file in the same directory, renames it,
+and on Unix fsyncs the directories. Unique names allow sequence reuse after backup
+restore. Export selects at most 1000 pending revisions and the folder's `sync_epoch`
+in a read transaction, releases it for publication, then marks exactly those
+revisions in a short IMMEDIATE transaction only if the epoch is unchanged. It loops
+until no pending revisions remain. A crash after publication can republish revisions;
+revision ids make this harmless. Export errors do not prevent imports.
+
+Changing the canonical sync folder atomically stores the path, resets all revisions
+(including other devices' revisions) to unexported, clears imported filenames, and
+increments `sync_epoch`. Re-selecting the same folder is a no-op. Clearing and
+re-setting republishes history. A sync already publishing to the old folder cannot
+mark revisions or import file markers for the new epoch. Imported revisions normally
+arrive with `exported = 1`, so ordinary syncs export only locally written changes.
 
 Imports remember individual filenames in `imported_files`, allowing late arrivals.
-Non-JSON filenames are ignored. A bad file or change is reported without blocking
-other imports. Each file uses one transaction with a savepoint per change, so a
-validation failure rolls back only that change. Applied, known and permanently
-rejected changes all count toward marking the immutable file imported; rejection
-notices appear once. Invalid JSON is permanent except for unexpected EOF, which
-may mean a partial copy. Read failures, truncated files and database failures are
-retried. Counts and notices are published only after the transaction commits.
-Imports preserve each revision, parent, merge references and device.
-Bodies deserialize through core invariants, ids must match, and record kinds
-cannot change, even after deletion. Revisions must be canonical UUIDv7 strings.
+Non-JSON filenames are ignored. The epoch is checked before reading and parsing
+each file; importing stops when it becomes stale. The envelope version is checked before interpreting
+its payload; unsupported versions remain retryable with an update-device notice.
+Each change is decoded separately from borrowed `RawValue`, without a whole-batch
+JSON value tree. Each file uses one transaction and a savepoint per change. Invalid
+ids, bodies or kinds roll back only that change. Kind validation reads history,
+independent of materialized records. After validation, each affected record is
+merged once per batch. If any affected record has no head, the entire file's changes
+are rolled back and the file is permanently recorded as corrupt. Valid files still
+import. No separate graph tables are maintained. A single query over `changes`
+computes each record's heads using the (record, parent) index and `json_each` for
+nonempty merges arrays; references from other records do not hide heads. Merge work is
+roughly linear in revisions and ancestry edges, plus the size of snapshot bodies.
+
+Applied, known and permanently rejected changes mark the immutable file processed.
+The marker atomically stores a rejected count and latest reason, including malformed
+files. `SyncDiagnostics` exposes the durable sum and latest reason independently of
+`SyncRun`, which carries only exported/imported counts and transient issues. Invalid
+JSON is permanent except for unexpected EOF, which may mean a partial copy. Read
+failures, truncated files, unsupported versions and database failures remain retryable
+in the current report's `skipped` list. Counts are exposed only after commit.
+Imports preserve each revision, parent, merge reference and device. Bodies deserialize
+through core invariants, ids must match, and kinds cannot change, even after deletion.
+Revisions must be canonical UUIDv7 strings.
 
 A record's heads are revisions that no known revision of that record names as its
 parent or in its `merges` array. A local edit names the winner as parent and all
 other current heads as merges, superseding them together. The greatest head by UUID string wins; ancestry takes precedence over
-wall-clock time. Recompute after imports and local writes, updating the body and
+wall-clock time. Materialize after imports and local writes, updating the body and
 lookup columns when the winner changes. This converges for the same revision
 history regardless of delivery order. Tombstones participate in the same rule.
 `conflicts` contains each current losing head, rebuilt for the affected record,
 so late ancestors do not leave false conflict warnings. The original losing
-bodies remain in `changes`.
+bodies remain in `changes`. Reported conflict counts exclude losing heads whose
+body equals the winner's body, including identical repairs made on two devices.
+Those heads remain in `conflicts` so the next write can merge all ancestry.
 
 This is whole-record merging: concurrent edits to different fields can overwrite
 each other. UUID time reflects device clocks, so clock skew can favor an unexpected
@@ -170,17 +208,38 @@ device even if its clock steps backward. Editing a conflicted record resolves al
 known branches; an unseen concurrent branch can still produce another notice.
 There is no dedicated conflict picker, history pruning, encryption or untrusted
 peer authentication. Keep the folder private and retain its batches for new
-installations. Duplicate open timers are settled by `Timers::load` and persisted
-by the next timer command, rather than during import.
+installations. Duplicate open timers are settled
+inside each import transaction before commit, and once during migration 003.
+`Store::settle` writes only stopped losers; timer commands
+also persist losers returned by loading. Readers never observe an unsettled import.
+Repairs from different partial histories may differ: with three or more devices
+running the same tag, repairs made with different knowledge can surface as a
+conflict. The next edit clears its known branches. Normal revision merging and
+further settlement converge once the same history has arrived. A further exchange
+of a settled history creates no new revisions.
 
-The app syncs after saved commands and on its 30-second refresh, then reloads data
-and report caches. Settings shows the last result/error and current conflict count.
-Folder I/O is synchronous; a slow or unavailable filesystem can delay the UI.
-Batches and revision histories have no size limit and are loaded into memory;
-merge work grows with the affected record's history. Device identity and revision
-monotonicity use the local database: restoring it cannot recover unseen edits or
-the revision high-water mark beyond the backup. Never run two writers with a
-copied device identity.
+The app requests sync at startup, after saved commands and every 30 seconds. At boot it opens
+one second `Engine` for file databases and retains it in `Arc<Mutex<Engine>>` for
+the app's lifetime. Worker threads use that engine; ordinary commands and native
+tray operations stay on the UI thread. One sync runs at a time; requests during a run
+queue exactly one rerun. Completion returns a cloneable `Message::Synced` with errors
+converted to strings, updates status, and reloads data and report caches. In-memory
+engines never sync. Iced 0.14 does not export `task::blocking`, so a standard thread
+and iced's futures channel provide the same task delivery without another dependency.
+
+Settings shows durable rejections and current conflicts only when nonzero, alongside
+the last run's timestamped status (or Sync disabled). The main error banner appears when the rejected total grows or a
+new transient problem appears; whole-sync errors count as transient.
+The rejected baseline is seeded from the initial snapshot, so old rejections do
+not raise a banner on launch. Banners describe only new problems. Problem identity
+excludes timestamps, so dismissing a repeated issue sticks.
+
+Full-snapshot revisions are an accepted trade-off: segment histories repeat in each
+session revision. Export batches are bounded by revision count, not bytes; imported
+files are read into memory, and large bodies still cost time to decode and store.
+There is no history pruning. Device identity and revision monotonicity use the local
+database: restoring it cannot recover unseen edits or the revision high-water mark
+beyond the backup. Never run two writers with a copied device identity.
 
 ## Testing
 

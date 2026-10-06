@@ -60,7 +60,7 @@ impl DateRange {
     pub fn bounds(self, tz: &TimeZone) -> Interval {
         Interval {
             start: midnight(self.first, tz),
-            end: midnight(self.last + 1.day(), tz),
+            end: next_midnight(self.last, tz),
         }
     }
 }
@@ -139,18 +139,35 @@ fn split_by_day(interval: Interval, tz: &TimeZone) -> impl Iterator<Item = (Date
             return None;
         }
         let date = cursor.to_zoned(tz.clone()).date();
-        let next = midnight(date + 1.day(), tz).min(interval.end);
+        let boundary = next_midnight(date, tz);
+        let next = if boundary > cursor {
+            boundary.min(interval.end)
+        } else {
+            interval.end
+        };
         let share = next.duration_since(cursor);
         cursor = next;
         Some((date, share))
     })
 }
 
+fn next_midnight(date: Date, tz: &TimeZone) -> Timestamp {
+    date.checked_add(1.day())
+        .map_or(Timestamp::MAX, |next| midnight(next, tz))
+}
+
 /// The first instant of `date` in `tz` (not always 00:00, around DST changes).
 fn midnight(date: Date, tz: &TimeZone) -> Timestamp {
-    date.to_zoned(tz.clone())
-        .expect("calendar dates in use are within jiff's supported range")
-        .timestamp()
+    date.to_zoned(tz.clone()).map_or_else(
+        |_| {
+            if date.year() < 0 {
+                Timestamp::MIN
+            } else {
+                Timestamp::MAX
+            }
+        },
+        |zoned| zoned.timestamp(),
+    )
 }
 
 #[cfg(test)]
@@ -269,5 +286,38 @@ mod tests {
         let totals = Totals::compute([&session], range, &warsaw(), NOW);
         let days: Vec<_> = totals.days().map(|(day, tags)| (day, tags[&tag])).collect();
         assert_eq!(days, [(date(2026, 10, 1), MIN * 30)]);
+    }
+
+    #[test]
+    fn civil_extremes_are_clamped_in_every_offset() {
+        for tz in [
+            TimeZone::UTC,
+            TimeZone::fixed(jiff::tz::offset(14)),
+            TimeZone::fixed(jiff::tz::offset(-12)),
+        ] {
+            for date in [Date::MIN, Date::MAX] {
+                let range = DateRange::day(date);
+                let bounds = range.bounds(&tz);
+                assert!(bounds.start <= bounds.end);
+                let manual = Session::manual(TagId::generate(), date, MIN).unwrap();
+                assert_eq!(Totals::compute([&manual], range, &tz, NOW).total(), MIN);
+            }
+            for (start, end) in [
+                (Timestamp::MIN, Timestamp::MIN + MIN * 60),
+                (Timestamp::MAX - MIN * 60, Timestamp::MAX),
+            ] {
+                let mut session =
+                    Session::start(TagId::generate(), None, &start.to_zoned(tz.clone()));
+                session.stop(end).unwrap();
+                let range = DateRange::new(
+                    start.to_zoned(tz.clone()).date(),
+                    end.to_zoned(tz.clone()).date(),
+                );
+                assert_eq!(
+                    Totals::compute([&session], range, &tz, end).total(),
+                    MIN * 60
+                );
+            }
+        }
     }
 }

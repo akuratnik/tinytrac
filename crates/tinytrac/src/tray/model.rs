@@ -21,6 +21,16 @@ pub struct Model {
 }
 
 impl Model {
+    pub fn same_menu(&self, other: &Self) -> bool {
+        self.items.len() == other.items.len()
+            && self.items.iter().zip(&other.items).all(|(a, b)| {
+                a.id == b.id
+                    && a.label == b.label
+                    && a.enabled == b.enabled
+                    && a.separator_before == b.separator_before
+            })
+    }
+
     pub fn new(data: &Data) -> Self {
         let mut items = Vec::new();
         for tag in &data.tags {
@@ -30,11 +40,11 @@ impl Model {
             }
             let running = timer.is_some_and(|s| matches!(s.status(), Status::Running(_)));
             let label = timer.map_or_else(
-                || tag.name().to_owned(),
+                || data.tag_name(tag.id).to_owned(),
                 |session| {
                     let status = if running { "running" } else { "paused" };
                     let minutes = session.logged(data.now.timestamp()).as_mins();
-                    format!("{} · {status} {minutes}m", tag.name())
+                    format!("{} · {status} {minutes}m", data.tag_name(tag.id))
                 },
             );
             let (action, message) = if running {
@@ -215,5 +225,27 @@ mod tests {
         assert!(menu.running);
         assert!(matches!(menu.message(&menu.items[0].id),
             Some(Message::Timers(timers::Message::Pause(id))) if id == tag));
+    }
+
+    #[test]
+    fn menu_comparison_uses_only_visible_items() {
+        let engine = tinytrac_engine::Engine::open_in_memory().unwrap();
+        let data = Data::load(&engine).unwrap();
+        let baseline = Model::new(&data);
+        let mut next = Model::new(&data);
+        next.tooltip = "new tooltip".into();
+        next.items[0].message = Message::Quit;
+        assert!(baseline.same_menu(&next));
+        next.items[0].enabled = !next.items[0].enabled;
+        assert!(!baseline.same_menu(&next));
+        next = Model::new(&data);
+        next.items[0].label.push('!');
+        assert!(!baseline.same_menu(&next));
+        next = Model::new(&data);
+        next.items[0].id.push('!');
+        assert!(!baseline.same_menu(&next));
+        next = Model::new(&data);
+        next.items[0].separator_before = !next.items[0].separator_before;
+        assert!(!baseline.same_menu(&next));
     }
 }
