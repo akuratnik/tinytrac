@@ -47,6 +47,14 @@ pub struct SyncContext {
 }
 
 impl SyncContext {
+    /// Bindings are reusable only for the same epoch, device, and destination.
+    /// Display label changes do not invalidate a transport.
+    pub fn compatible_with(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+            && self.device == other.device
+            && self.target.same_identity(&other.target)
+    }
+
     pub fn target(&self) -> &SyncTarget {
         &self.target
     }

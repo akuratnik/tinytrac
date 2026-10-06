@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use app::App;
 
 fn main() -> iced::Result {
+    credentials::initialize();
     let path = database_path();
     iced::daemon(move || App::boot(&path), App::update, App::view)
         .title(|_: &App, _| "tinytrac".to_owned())

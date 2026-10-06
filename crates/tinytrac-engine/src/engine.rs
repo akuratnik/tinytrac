@@ -272,9 +272,10 @@ impl Engine {
     pub fn sync(&mut self, transport: &mut (impl Transport + ?Sized)) -> Result<crate::SyncRun> {
         let context = transport.context();
         let current = self.sync_context()?;
-        if !current.as_ref().is_some_and(|current| {
-            current.epoch == context.epoch && current.target.same_identity(&context.target)
-        }) {
+        if !current
+            .as_ref()
+            .is_some_and(|current| current.compatible_with(context))
+        {
             return Err(Error::StaleSyncContext);
         }
         if let SyncTarget::Folder(path) = &context.target {

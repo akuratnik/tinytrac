@@ -43,7 +43,7 @@ pub enum Message {
     Synced(Result<SyncRun, sync::Failure>),
     WorkerSynced(u64, Result<SyncRun, sync::Failure>),
     BrowserFinished(u64, Result<(), sync::Failure>),
-    SignedIn(u64, Result<google::SignedIn, sync::Failure>),
+    SignedIn(u64, Result<Option<google::SignedIn>, sync::Failure>),
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
     DismissError,
@@ -111,12 +111,9 @@ impl App {
             Message::Timers(message) => self.timers.update(message, &mut self.engine),
             Message::History(message) => self.history.update(message, &mut self.engine, &self.data),
             Message::Reports(message) => self.reports.update(message, &self.engine, &self.data),
-            Message::Settings(
-                message @ (settings::Message::SignIn
-                | settings::Message::CancelSignIn
-                | settings::Message::SignOut
-                | settings::Message::SyncMode(_)),
-            ) => return self.google_action(&message),
+            Message::Settings(settings::Message::Account(message)) => {
+                return self.google_action(&message);
+            }
             Message::Settings(message) => {
                 if matches!(message, settings::Message::SaveSyncFolder) {
                     self.google.cancel();

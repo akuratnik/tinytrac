@@ -302,3 +302,28 @@ fn authentication_on_the_second_key_keeps_the_first_import_and_retries_only_the_
     assert_eq!(transport.reads, ["1"]);
     assert_eq!(engine.tags().unwrap().len(), 2);
 }
+
+#[test]
+fn another_devices_context_is_rejected_before_transport_io() {
+    let mut a = Engine::open_in_memory().unwrap();
+    let mut b = Engine::open_in_memory().unwrap();
+    for engine in [&mut a, &mut b] {
+        engine
+            .set_sync_target(Some(remote("same", "Same account")))
+            .unwrap();
+        engine.create_tag("Local history").unwrap();
+    }
+    let ca = a.sync_context().unwrap().unwrap();
+    let cb = b.sync_context().unwrap().unwrap();
+    assert_eq!(ca.epoch(), cb.epoch());
+    assert!(ca.target().same_identity(cb.target()));
+    assert_ne!(ca.device(), cb.device());
+    let mut transport = Memory::new(ca);
+    assert!(matches!(
+        b.sync(&mut transport),
+        Err(Error::StaleSyncContext)
+    ));
+    assert!(transport.calls.is_empty());
+    transport.context = cb;
+    assert_eq!(b.sync(&mut transport).unwrap().exported, 1);
+}

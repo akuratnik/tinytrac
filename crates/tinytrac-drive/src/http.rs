@@ -55,10 +55,23 @@ pub(crate) fn check(mut response: Response) -> Result<Response> {
         return Ok(response);
     }
     let status = response.status().as_u16();
+    if status == 401 {
+        return Err(Error::AuthRequired(
+            "Google no longer accepts this sign-in; sign in again".into(),
+        ));
+    }
     let value: serde_json::Value = json(&mut response).unwrap_or_default();
     if value.get("error").and_then(serde_json::Value::as_str) == Some("invalid_grant") {
         return Err(Error::AuthRequired(
             "Google sign-in expired or was revoked; sign in again".into(),
+        ));
+    }
+    if matches!(
+        value.get("error").and_then(serde_json::Value::as_str),
+        Some("invalid_client" | "unauthorized_client" | "invalid_scope")
+    ) {
+        return Err(Error::AuthRequired(
+            "Google rejected this app's sign-in configuration; contact the app maintainer".into(),
         ));
     }
     let reasons = value
@@ -66,6 +79,20 @@ pub(crate) fn check(mut response: Response) -> Result<Response> {
         .and_then(serde_json::Value::as_array);
     let has =
         |reason: &str| reasons.is_some_and(|errors| errors.iter().any(|e| e["reason"] == reason));
+    if status == 403
+        && [
+            "insufficientPermissions",
+            "insufficientFilePermissions",
+            "appNotAuthorizedToFile",
+            "domainPolicy",
+        ]
+        .iter()
+        .any(|reason| has(reason))
+    {
+        return Err(Error::AuthRequired(
+            "Google denied Drive access; sign in again with app-data access or contact your administrator".into(),
+        ));
+    }
     let message = if status == 429 || has("rateLimitExceeded") || has("userRateLimitExceeded") {
         "Google Drive is busy; will retry".into()
     } else if has("storageQuotaExceeded") {
@@ -83,6 +110,7 @@ pub(crate) struct Tokens {
     pub access_token: String,
     pub expires_in: u64,
     pub refresh_token: Option<String>,
+    pub scope: Option<String>,
 }
 
 pub(crate) fn token(

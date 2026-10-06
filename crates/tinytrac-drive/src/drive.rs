@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     time::{Duration, Instant},
 };
 
@@ -12,7 +13,6 @@ use crate::{Client, Endpoints, Secret, http};
 
 /// One account/device binding. Reuse it across sync runs to retain the change index.
 /// Names such as `device/batch.json` are labels: appDataFolder has no directories here.
-#[derive(Debug)]
 pub struct Drive {
     client: Client,
     refresh_token: Secret,
@@ -22,6 +22,18 @@ pub struct Drive {
     access: Option<(Secret, Instant)>,
     index: BTreeMap<String, String>,
     cursor: Option<String>,
+    last_enumeration: Option<Instant>,
+}
+
+impl fmt::Debug for Drive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Drive")
+            .field("client", &self.client)
+            .field("context", &self.context)
+            .field("index.len()", &self.index.len())
+            .field("cursor.is_some()", &self.cursor.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +93,7 @@ impl Drive {
             access: None,
             index: BTreeMap::new(),
             cursor: None,
+            last_enumeration: None,
         }
     }
 
@@ -191,6 +204,7 @@ impl Drive {
         // Commit only complete enumerations. On failure the old cursor is retryable.
         self.index = index;
         self.cursor = Some(start.start_page_token);
+        self.last_enumeration = Some(Instant::now());
         Ok(())
     }
 
@@ -281,17 +295,27 @@ impl Transport for Drive {
             return Err(http::remote("Google returned an invalid upload session"));
         }
         let response = self.request(Method::Put, &location, "application/octet-stream", bytes)?;
-        if !matches!(response.status().as_u16(), 200 | 201) {
-            http::check(response)?;
-            return Err(http::remote("Google upload was not completed; will retry"));
+        if response.status().as_u16() == 308 {
+            return Err(http::remote("Google upload was interrupted; will retry"));
         }
-        Ok(())
+        let response = http::check(response)?;
+        if matches!(response.status().as_u16(), 200 | 201) {
+            Ok(())
+        } else {
+            Err(http::remote("Google upload was not completed; will retry"))
+        }
     }
 
     fn list(&mut self) -> Result<Vec<String>> {
         match self.cursor.clone() {
-            Some(cursor) => self.changes(cursor)?,
-            None => self.bootstrap()?,
+            Some(cursor)
+                if self
+                    .last_enumeration
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(6 * 3600)) =>
+            {
+                self.changes(cursor)?;
+            }
+            _ => self.bootstrap()?,
         }
         Ok(self.index.keys().cloned().collect())
     }
@@ -318,6 +342,26 @@ impl Transport for Drive {
 #[cfg(test)]
 mod tests {
     use super::batch_name;
+
+    #[test]
+    fn periodically_rebuilds_even_when_changes_omit_a_file() {
+        use std::time::{Duration, Instant};
+        use tinytrac_engine::Transport;
+
+        let server = crate::tests::enumeration_server();
+        let mut drive = server.drive();
+        assert_eq!(drive.list().unwrap(), ["enumeration-1"]);
+        assert_eq!(drive.list().unwrap(), ["enumeration-1"]);
+        drive.last_enumeration = Instant::now().checked_sub(Duration::from_secs(6 * 3600));
+        assert_eq!(drive.list().unwrap(), ["enumeration-2"]);
+        assert_eq!(drive.list().unwrap(), ["enumeration-2"]);
+        let debug = format!("{drive:?}");
+        assert!(debug.contains("index.len(): 1"));
+        assert!(debug.contains("cursor.is_some(): true"));
+        assert!(!debug.contains("enumeration-2"));
+        assert!(!debug.contains("refresh"));
+        assert!(!debug.contains("access"));
+    }
 
     #[test]
     fn labels_only_require_a_device_and_json_file() {

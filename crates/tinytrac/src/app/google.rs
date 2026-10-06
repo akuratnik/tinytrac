@@ -53,9 +53,9 @@ impl Drop for State {
 }
 
 impl App {
-    pub(super) fn google_action(&mut self, message: &settings::Message) -> Task<Message> {
+    pub(super) fn google_action(&mut self, message: &settings::Account) -> Task<Message> {
         match message {
-            settings::Message::SignIn => {
+            settings::Account::SignIn => {
                 let Some(client) = self.sync.client.clone() else {
                     return Task::none();
                 };
@@ -65,8 +65,8 @@ impl App {
                 self.google.cancel = Some(cancel.clone());
                 return authorize(client, generation, cancel);
             }
-            settings::Message::CancelSignIn => self.google.cancel(),
-            settings::Message::SignOut => {
+            settings::Account::CancelSignIn => self.google.cancel(),
+            settings::Account::SignOut => {
                 self.google.cancel();
                 let target = self.data.sync_target.clone();
                 match self.engine.set_sync_target(None) {
@@ -75,13 +75,18 @@ impl App {
                         self.refresh();
                         self.error = None;
                         if let Some(SyncTarget::Remote { id, .. }) = target {
-                            self.error = self.sync.credentials.delete(&id).err();
+                            self.error = self
+                                .sync
+                                .credentials
+                                .delete(&id)
+                                .err()
+                                .map(|error| error.to_string());
                         }
                     }
                     Err(error) => self.error = Some(error.to_string()),
                 }
             }
-            settings::Message::SyncMode(mode) => {
+            settings::Account::SyncMode(mode) => {
                 if *mode == SyncMode::Google && self.sync.client.is_none() {
                     return Task::none();
                 }
@@ -98,7 +103,6 @@ impl App {
                     }
                 }
             }
-            _ => unreachable!("only account actions are routed here"),
         }
         Task::none()
     }
@@ -106,19 +110,24 @@ impl App {
     pub(super) fn signed_in(
         &mut self,
         generation: u64,
-        result: Result<SignedIn, Failure>,
+        result: Result<Option<SignedIn>, Failure>,
     ) -> Task<Message> {
         self.refresh();
         if generation != self.google.generation || !self.google.waiting() {
             return Task::none();
         }
         self.google.cancel();
+        let result = match result {
+            Ok(Some(signed)) => Ok(signed),
+            Ok(None) => return Task::none(),
+            Err(error) => Err(error),
+        };
         let result = result.and_then(|signed| {
             let id = format!("google-drive:{}", signed.account.id);
             self.sync
                 .credentials
                 .save(&id, &signed.token)
-                .map_err(Failure::Other)?;
+                .map_err(|error| Failure::Other(error.to_string()))?;
             self.engine
                 .set_sync_target(Some(SyncTarget::Remote {
                     id,
@@ -148,9 +157,11 @@ fn authorize(client: Client, generation: u64, cancel: Arc<AtomicBool>) -> Task<M
             tinytrac_drive::authorize(&client, &Endpoints::default(), &cancel, |url| {
                 open_browser(url, sender)
             })
-            .map(|authorization| SignedIn {
-                account: authorization.account,
-                token: authorization.refresh_token,
+            .map(|authorization| {
+                authorization.map(|authorization| SignedIn {
+                    account: authorization.account,
+                    token: authorization.refresh_token,
+                })
             })
             .map_err(Failure::from)
         }),
@@ -202,12 +213,12 @@ mod tests {
             id: "test".into(),
             secret: "test".into(),
         });
-        let _ = app.google_action(&settings::Message::SyncMode(SyncMode::Google));
+        let _ = app.google_action(&settings::Account::SyncMode(SyncMode::Google));
         (app, store)
     }
     fn start(app: &mut App) -> u64 {
         // Dropping an unpolled iced task avoids all browser and network I/O.
-        let _ = app.google_action(&settings::Message::SignIn);
+        let _ = app.google_action(&settings::Account::SignIn);
         app.google.generation
     }
     fn success() -> SignedIn {
@@ -221,10 +232,21 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_authorization_clears_waiting_without_an_error() {
+        let (mut app, store) = app();
+        let generation = start(&mut app);
+        assert_eq!(app.signed_in(generation, Ok(None)).units(), 0);
+        assert!(!app.google.waiting());
+        assert!(app.error.is_none());
+        assert!(app.data.sync_target.is_none());
+        assert!(store.tokens.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn sign_in_and_local_sign_out() {
         let (mut app, store) = app();
         let generation = start(&mut app);
-        let _ = app.signed_in(generation, Ok(success()));
+        let _ = app.signed_in(generation, Ok(Some(success())));
         assert_eq!(
             store.load("google-drive:123").unwrap().unwrap().expose(),
             "refresh"
@@ -236,7 +258,7 @@ mod tests {
                 label: "me@example.com".into()
             })
         );
-        let _ = app.google_action(&settings::Message::SignOut);
+        let _ = app.google_action(&settings::Account::SignOut);
         assert!(app.data.sync_target.is_none());
         assert!(store.load("google-drive:123").unwrap().is_none());
     }
@@ -253,7 +275,7 @@ mod tests {
                 label: "Other".into(),
             }))
             .unwrap();
-        let _ = app.signed_in(generation, Ok(success()));
+        let _ = app.signed_in(generation, Ok(Some(success())));
         assert!(store.tokens.lock().unwrap().is_empty());
         assert!(!app.google.waiting());
     }
@@ -269,10 +291,15 @@ mod tests {
         app.refresh();
         store.fail.store(true, Ordering::Relaxed);
         let generation = start(&mut app);
-        let _ = app.signed_in(generation, Ok(success()));
+        let _ = app.signed_in(generation, Ok(Some(success())));
         assert_eq!(app.data.sync_target, original);
         assert!(store.load("google-drive:123").unwrap().is_none());
-        assert_eq!(app.error.as_deref(), Some("Keychain locked"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("unlock your login keychain")
+        );
     }
 
     #[test]
@@ -280,29 +307,25 @@ mod tests {
         let (mut app, store) = app();
         let cancelled = start(&mut app);
         let flag = app.google.cancel.clone().unwrap();
-        let _ = app.google_action(&settings::Message::CancelSignIn);
+        let _ = app.google_action(&settings::Account::CancelSignIn);
         assert!(flag.load(Ordering::Relaxed));
-        let _ = app.signed_in(cancelled, Ok(success()));
+        let _ = app.signed_in(cancelled, Ok(Some(success())));
         let old = start(&mut app);
         let newer = start(&mut app);
-        let _ = app.signed_in(old, Ok(success()));
+        let _ = app.signed_in(old, Ok(Some(success())));
         assert!(app.google.waiting());
-        let _ = app.google_action(&settings::Message::SyncMode(SyncMode::Folder));
-        let _ = app.signed_in(newer, Ok(success()));
+        let _ = app.google_action(&settings::Account::SyncMode(SyncMode::Folder));
+        let _ = app.signed_in(newer, Ok(Some(success())));
         assert!(store.tokens.lock().unwrap().is_empty());
         assert!(app.data.sync_target.is_none());
     }
 
     #[test]
     fn auth_failure_pauses_and_sign_in_resumes_without_repeated_banner() {
-        let directory = std::env::temp_dir().join(format!(
-            "tinytrac-auth-{}",
-            tinytrac_core::TagId::generate()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let (mut app, _) = configured(Engine::open(directory.join("db")).unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = configured(Engine::open(directory.path().join("db")).unwrap());
         let generation = start(&mut app);
-        assert_eq!(app.signed_in(generation, Ok(success())).units(), 1);
+        assert_eq!(app.signed_in(generation, Ok(Some(success()))).units(), 1);
         let failure = Err(Failure::AuthRequired("expired".into()));
         let _ = app.update(Message::Synced(failure.clone()));
         assert!(app.sync.auth_required);
@@ -315,10 +338,9 @@ mod tests {
         let _ = app.update(Message::Synced(failure));
         assert!(app.error.is_none());
         let generation = start(&mut app);
-        assert_eq!(app.signed_in(generation, Ok(success())).units(), 1);
+        assert_eq!(app.signed_in(generation, Ok(Some(success()))).units(), 1);
         assert!(!app.sync.auth_required);
         drop(app);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -329,7 +351,7 @@ mod tests {
             "tinytrac-folder-{}",
             tinytrac_core::TagId::generate()
         ));
-        let _ = app.google_action(&settings::Message::SyncMode(SyncMode::Folder));
+        let _ = app.google_action(&settings::Account::SyncMode(SyncMode::Folder));
         let _ = app.update(Message::Settings(settings::Message::SyncFolder(
             folder.display().to_string(),
         )));
@@ -340,12 +362,12 @@ mod tests {
             first.epoch(),
             app.engine.sync_context().unwrap().unwrap().epoch()
         );
-        let _ = app.google_action(&settings::Message::SyncMode(SyncMode::Google));
+        let _ = app.google_action(&settings::Account::SyncMode(SyncMode::Google));
         let generation = start(&mut app);
-        let _ = app.signed_in(generation, Ok(success()));
+        let _ = app.signed_in(generation, Ok(Some(success())));
         assert!(app.engine.sync_context().unwrap().unwrap().epoch() > first.epoch());
         assert_eq!(app.engine.tags().unwrap().len(), 1);
-        let _ = app.google_action(&settings::Message::SyncMode(SyncMode::Folder));
+        let _ = app.google_action(&settings::Account::SyncMode(SyncMode::Folder));
         let _ = app.update(Message::Settings(settings::Message::SaveSyncFolder));
         assert_eq!(
             app.data.sync_target,
@@ -358,7 +380,7 @@ mod tests {
     fn late_sync_auth_failure_cannot_expire_new_sign_in() {
         let (mut app, _) = app();
         let generation = start(&mut app);
-        let _ = app.signed_in(generation, Ok(success()));
+        let _ = app.signed_in(generation, Ok(Some(success())));
         let _ = app.update(Message::WorkerSynced(
             0,
             Err(Failure::AuthRequired("old account".into())),

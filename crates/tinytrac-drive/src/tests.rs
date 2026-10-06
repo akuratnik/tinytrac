@@ -53,11 +53,11 @@ fn reply(status: u16, value: &Value) -> Reply {
 fn token() -> Reply {
     reply(
         200,
-        &json!({"access_token":"access", "expires_in":3600, "refresh_token":"refresh"}),
+        &json!({"access_token":"access", "expires_in":3600, "refresh_token":"refresh", "scope":"https://www.googleapis.com/auth/drive.appdata"}),
     )
 }
 
-struct Server {
+pub(super) struct Server {
     endpoints: Endpoints,
     context: tinytrac_engine::SyncContext,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -112,7 +112,7 @@ impl Server {
         }
     }
 
-    fn drive(&self) -> Drive {
+    pub(super) fn drive(&self) -> Drive {
         Drive::new(
             client(),
             Secret::new("refresh".into()),
@@ -241,6 +241,7 @@ fn authorization_url_exchange_and_account() {
         },
     )
     .unwrap();
+    let result = result.unwrap();
     assert_eq!(result.account.id, "account");
     assert_eq!(result.account.email, "me@example.com");
     assert_eq!(result.refresh_token.expose(), "refresh");
@@ -262,13 +263,14 @@ fn authorization_url_exchange_and_account() {
 
 #[test]
 fn callback_failures_cancel_timeout_and_missing_refresh() {
-    let server =
-        Server::new(|_, _| reply(200, &json!({"access_token":"access", "expires_in":3600})));
+    let server = Server::new(|_, _| {
+        reply(
+            200,
+            &json!({"access_token":"access", "expires_in":3600, "scope":"https://www.googleapis.com/auth/drive.appdata"}),
+        )
+    });
     for (suffix, expected) in [
-        ("state=wrong&code=secret", "state did not match"),
         ("state={state}&error=access_denied", "denied"),
-        ("state=wrong&error=access_denied", "state did not match"),
-        ("state={state}&code=a&code=b", "duplicate"),
         ("state={state}&code=a", "no refresh token"),
     ] {
         let result = authorize(
@@ -293,9 +295,8 @@ fn callback_failures_cancel_timeout_and_missing_refresh() {
             &AtomicBool::new(true),
             |_| panic!()
         )
-        .unwrap_err()
-        .to_string()
-        .contains("cancelled")
+        .unwrap()
+        .is_none()
     );
     assert!(
         oauth::authorize_with_timeout(
@@ -393,7 +394,7 @@ fn errors_are_safe_and_retryable_except_revoked_grants() {
 
 #[test]
 fn resumable_upload_metadata_bytes_and_final_confirmation() {
-    for final_status in [200, 201, 308, 500] {
+    for final_status in [200, 201, 202, 204, 308, 500] {
         let server = Server::new(move |r, origin| {
             if r.target == "/token" {
                 return token();
@@ -414,10 +415,14 @@ fn resumable_upload_metadata_bytes_and_final_confirmation() {
             assert_eq!(r.body, [0, 1, 255]);
             reply(final_status, &json!({"id":"new"}))
         });
-        assert_eq!(
-            server.drive().publish(BATCH, &[0, 1, 255]).is_ok(),
-            final_status < 300
-        );
+        let result = server.drive().publish(BATCH, &[0, 1, 255]);
+        assert_eq!(result.is_ok(), matches!(final_status, 200 | 201));
+        if final_status == 308 {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Google upload was interrupted; will retry"
+            );
+        }
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert_eq!(
@@ -495,6 +500,8 @@ fn bootstrap_changes_pagination_filtering_and_rebuild() {
 
 #[test]
 fn two_engines_converge_through_drive() {
+    // This fixture replays every file as a change; it does not exercise incremental
+    // changes end-to-end. Cursor/pagination behavior is covered separately.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut pending = String::new();
     let server = Server::new(move |r, origin| {
@@ -594,7 +601,7 @@ fn cancellation_interrupts_an_incomplete_callback_and_releases_port() {
         }));
         Ok(())
     });
-    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    assert!(result.unwrap().is_none());
     sender.unwrap().join().unwrap();
     assert!(TcpStream::connect(address).is_err());
 }
@@ -608,7 +615,13 @@ fn a_second_401_stops_and_expiring_tokens_refresh_early() {
             reply(401, &json!({}))
         }
     });
-    assert!(server.drive().read("file").is_err());
+    let error = server.drive().read("file").unwrap_err();
+    assert!(matches!(error, Error::AuthRequired(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("Google no longer accepts this sign-in; sign in again")
+    );
     assert_eq!(server.requests.lock().unwrap().len(), 4);
     let server = Server::new(|r, _| {
         if r.target == "/token" {
@@ -674,8 +687,12 @@ fn failed_change_page_keeps_previous_cursor_and_failed_reads_remain_listed() {
 
 #[test]
 fn oversized_callback_is_closed_before_accepting_a_valid_one() {
-    let server =
-        Server::new(|_, _| reply(200, &json!({"access_token":"access", "expires_in":3600})));
+    let server = Server::new(|_, _| {
+        reply(
+            200,
+            &json!({"access_token":"access", "expires_in":3600, "scope":"https://www.googleapis.com/auth/drive.appdata"}),
+        )
+    });
     let result = authorize(
         &client(),
         &server.endpoints,
@@ -704,4 +721,230 @@ fn invalid_publication_names_fail_before_http() {
         assert!(drive.publish(name, b"batch").is_err());
     }
     assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn invalid_callbacks_return_400_then_genuine_callback_succeeds() {
+    let server = Server::new(|r, _| {
+        if r.target == "/token" {
+            token()
+        } else {
+            reply(
+                200,
+                &json!({"user":{"permissionId":"account", "emailAddress":"me@example.com"}}),
+            )
+        }
+    });
+    let mut browser = None;
+    let result = authorize(
+        &client(),
+        &server.endpoints,
+        &AtomicBool::new(false),
+        |url| {
+            let p = params(url.split_once('?').unwrap().1);
+            browser = Some(thread::spawn(move || {
+                let address = p["redirect_uri"]
+                    .strip_prefix("http://")
+                    .unwrap()
+                    .split('/')
+                    .next()
+                    .unwrap();
+                for query in [
+                    "state=wrong&code=probe".to_owned(),
+                    "state=wrong&error=access_denied".to_owned(),
+                    format!("state={}&code=a&code=b", p["state"]),
+                    format!("state={}&state={}&code=a", p["state"], p["state"]),
+                    format!("state={}", p["state"]),
+                ] {
+                    let mut stream = TcpStream::connect(address).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    write!(
+                        stream,
+                        "GET /callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    )
+                    .unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).unwrap();
+                    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+                }
+                callback(
+                    &p["redirect_uri"],
+                    &format!("?state={}&code=genuine", p["state"]),
+                );
+            }));
+            Ok(())
+        },
+    )
+    .unwrap()
+    .unwrap();
+    browser.unwrap().join().unwrap();
+    assert_eq!(result.account.id, "account");
+    assert_eq!(
+        params(std::str::from_utf8(&server.requests.lock().unwrap()[0].body).unwrap())["code"],
+        "genuine"
+    );
+}
+
+#[test]
+fn authorization_requires_appdata_scope() {
+    for scope in [
+        None,
+        Some(""),
+        Some("openid"),
+        Some("https://www.googleapis.com/auth/drive.appdata.extra"),
+        Some("openid https://www.googleapis.com/auth/drive.appdata email"),
+    ] {
+        let server = Server::new(move |r, _| {
+            if r.target == "/token" {
+                reply(
+                    200,
+                    &json!({"access_token":"access", "expires_in":3600, "refresh_token":"refresh", "scope":scope}),
+                )
+            } else {
+                reply(
+                    200,
+                    &json!({"user":{"permissionId":"account", "emailAddress":"me@example.com"}}),
+                )
+            }
+        });
+        let result = authorize(
+            &client(),
+            &server.endpoints,
+            &AtomicBool::new(false),
+            |url| {
+                let p = params(url.split_once('?').unwrap().1);
+                callback(
+                    &p["redirect_uri"],
+                    &format!("?state={}&code=code", p["state"]),
+                );
+                Ok(())
+            },
+        );
+        if scope.is_some_and(|s| s.starts_with("openid https://")) {
+            assert!(result.unwrap().is_some());
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::AuthRequired(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("app-data access was not granted")
+            );
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn permanent_token_and_permission_errors_require_action() {
+    for reason in ["invalid_client", "unauthorized_client", "invalid_scope"] {
+        let server = Server::new(move |_, _| reply(400, &json!({"error":reason})));
+        let error = server.drive().read("file").unwrap_err();
+        assert!(matches!(error, Error::AuthRequired(_)));
+        assert!(error.to_string().contains("sign-in configuration"));
+        assert!(!error.to_string().contains("will retry"));
+    }
+    for reason in [
+        "insufficientPermissions",
+        "insufficientFilePermissions",
+        "appNotAuthorizedToFile",
+        "domainPolicy",
+    ] {
+        let server = Server::new(move |r, _| {
+            if r.target == "/token" {
+                token()
+            } else {
+                reply(403, &json!({"error":{"errors":[{"reason":reason}]}}))
+            }
+        });
+        let error = server.drive().read("file").unwrap_err();
+        assert!(matches!(error, Error::AuthRequired(_)));
+        assert!(error.to_string().contains("Google denied Drive access"));
+        assert!(!error.to_string().contains("will retry"));
+    }
+}
+
+#[test]
+fn upload_session_401_retries_once() {
+    for final_status in [200, 401] {
+        let mut puts = 0;
+        let server = Server::new(move |r, origin| {
+            if r.target == "/token" {
+                return token();
+            }
+            if r.method == "POST" {
+                return Reply {
+                    headers: format!("Location: {origin}/session\r\n"),
+                    ..reply(200, &json!({}))
+                };
+            }
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.target, "/session");
+            assert_eq!(r.body, b"batch");
+            puts += 1;
+            reply(if puts == 1 { 401 } else { final_status }, &json!({}))
+        });
+        let result = server.drive().publish(BATCH, b"batch");
+        if final_status == 200 {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(Error::AuthRequired(_))));
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|r| r.method == "PUT").count(), 2);
+        assert_eq!(requests.iter().filter(|r| r.target == "/token").count(), 2);
+        assert_eq!(requests.len(), 5);
+    }
+}
+
+// Shared with Drive's private clock/index regression tests.
+pub(super) fn enumeration_server() -> Server {
+    let mut enumerations = 0;
+    Server::new(move |r, _| match r.target.split('?').next().unwrap() {
+        "/token" => token(),
+        "/drive/v3/changes/startPageToken" => reply(200, &json!({"startPageToken":"start"})),
+        "/drive/v3/files" => {
+            enumerations += 1;
+            reply(
+                200,
+                &json!({"files":[{"id":format!("enumeration-{enumerations}"), "name":"peer/batch.json"}]}),
+            )
+        }
+        "/drive/v3/changes" => reply(200, &json!({"newStartPageToken":"next", "changes":[]})),
+        _ => panic!("unexpected request"),
+    })
+}
+
+#[test]
+fn idle_connection_expires_before_the_next_callback() {
+    let server = Server::new(|_, _| token());
+    let mut idle = None;
+    let result = oauth::authorize_with_timeout(
+        &client(),
+        &server.endpoints,
+        &AtomicBool::new(false),
+        |url| {
+            let p = params(url.split_once('?').unwrap().1);
+            let address = p["redirect_uri"]
+                .strip_prefix("http://")
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap();
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(b"GET /callback?").unwrap();
+            idle = Some(stream);
+            callback(
+                &p["redirect_uri"],
+                &format!("?state={}&error=access_denied", p["state"]),
+            );
+            Ok(())
+        },
+        Duration::from_millis(1500),
+    );
+    assert_eq!(result.unwrap_err().to_string(), "Google sign-in denied");
+    let mut bytes = [0; 1];
+    assert_eq!(idle.unwrap().read(&mut bytes).unwrap(), 0);
 }

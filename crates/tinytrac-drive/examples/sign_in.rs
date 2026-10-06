@@ -31,7 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret: desktop.client_secret,
     };
     let endpoints = Endpoints::default();
-    let authorization = authorize(&client, &endpoints, &AtomicBool::new(false), open_browser)?;
+    let Some(authorization) =
+        authorize(&client, &endpoints, &AtomicBool::new(false), open_browser)?
+    else {
+        return Ok(());
+    };
     println!("Connected as {}", authorization.account.email);
     let mut engine = Engine::open_in_memory()?;
     engine.set_sync_target(Some(SyncTarget::Remote {

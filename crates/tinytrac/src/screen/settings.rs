@@ -45,11 +45,16 @@ impl std::fmt::Display for SyncMode {
 }
 
 #[derive(Debug, Clone)]
-pub enum Message {
+pub enum Account {
     SyncMode(SyncMode),
     SignIn,
     CancelSignIn,
     SignOut,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Account(Account),
     SyncFolder(String),
     SaveSyncFolder,
     BreakBank(bool),
@@ -83,9 +88,8 @@ impl State {
 
     pub fn update(&mut self, message: Message, engine: &mut Engine) -> Result {
         match message {
-            Message::SyncMode(_) | Message::SignIn | Message::CancelSignIn | Message::SignOut => {
-                unreachable!("account actions are handled by the app")
-            }
+            // The app routes account actions before invoking this screen.
+            Message::Account(_) => return Ok(Outcome::Edited),
             Message::SyncFolder(folder) => {
                 self.sync_folder = folder;
                 return Ok(Outcome::Edited);
@@ -245,7 +249,9 @@ impl State {
         let modes = sync_modes(google_available);
         let mut sync = column![
             text("Sync"),
-            pick_list(modes, Some(self.sync_mode), Message::SyncMode)
+            pick_list(modes, Some(self.sync_mode), |mode| Message::Account(
+                Account::SyncMode(mode)
+            ))
         ]
         .spacing(6);
         match self.sync_mode {
@@ -271,12 +277,14 @@ impl State {
                     sync = sync.push(
                         row![
                             button("Waiting for browser…"),
-                            button("Cancel").on_press(Message::CancelSignIn)
+                            button("Cancel").on_press(Message::Account(Account::CancelSignIn))
                         ]
                         .spacing(6),
                     );
                 } else if (auth_required || data.sync_target.is_none()) && google_available {
-                    sync = sync.push(button("Sign in with Google").on_press(Message::SignIn));
+                    sync = sync.push(
+                        button("Sign in with Google").on_press(Message::Account(Account::SignIn)),
+                    );
                 }
                 if let Some(SyncTarget::Remote { label, .. }) = &data.sync_target {
                     if !auth_required {
@@ -285,7 +293,7 @@ impl State {
                     sync = sync.push(
                         button("Sign out")
                             .style(button::secondary)
-                            .on_press(Message::SignOut),
+                            .on_press(Message::Account(Account::SignOut)),
                     );
                 }
                 sync = sync.push(muted("The first sync uploads this Mac's history. Sign in to the same Google account on both Macs."));

@@ -162,7 +162,8 @@ winners. These layers share no reverse dependencies.
 `Engine::sync_context()` captures target, epoch and device together in a read
 transaction. Its immutable `SyncContext` binds caller-created transports to that
 selection. `Engine::sync(&mut transport)` reads the transport's context and rejects
-stale epochs or target identities before transport I/O, including A -> B -> A switches. Folder runs re-resolve the path and check database containment
+incompatible epochs, devices, or target identities before transport I/O via
+`SyncContext::compatible_with`, including A -> B -> A switches. Folder runs re-resolve the path and check database containment
 before I/O; a changed canonical path requires selecting the target again.
 
 Files are `<device>/<last-seq:020>-<uuidv7>.json`, containing format
@@ -252,7 +253,7 @@ The app requests sync at startup, after saved commands and every 30 seconds. At 
 one second `Engine` for file databases and retains it with an optional folder or Drive transport cache in one worker
 for the app's lifetime. An `Arc<Mutex<Worker>>` moves serialized work between
 threads; transport state survives runs and label changes, and is dropped when the
-target identity or epoch changes. A stale-context race returns an empty run without
+target identity, device, or epoch changes, using the same compatibility helper. A stale-context race returns an empty run without
 a problem banner; the queued rerun uses the current target.
 Worker threads use that engine; ordinary commands and native
 tray operations stay on the UI thread. One sync runs at a time; requests during a run
@@ -297,10 +298,10 @@ Without both values, Settings omits the Google Drive choice. The optional client
 and credential store are injectable in app state for network-free tests.
 
 `credentials.rs` exposes a small `Store` trait (load/save/delete by remote target
-id). Production uses keyring 3.6.3 with explicit platform features: `apple-native`
-on macOS, `async-secret-service`, `async-io`, and `crypto-rust` on Linux. The latter
-uses secret-service 4.0.0 and zbus 4.4.0, alongside the tray's zbus 5; it does not
-link libdbus. There is no plaintext or mock fallback on supported platforms.
+id), with a typed error that retains keychain-unlock guidance. Startup installs a
+`keyring-core` 1.x default store: `apple-native-keyring-store` (`keychain`) on macOS,
+`zbus-secret-service-keyring-store` (`rt-async-io-crypto-rust`) on Linux. Linux shares
+zbus 5 with the tray, uses pure Rust crypto, and does not link libdbus. There is no plaintext or mock fallback on supported platforms.
 The service is `net.expertstudio.tinytrac`; accounts are `google-drive:<permission id>`.
 Tests inject an in-memory store.
 
@@ -326,19 +327,22 @@ history republishing rules.
 32-byte PKCE verifier (S256), an independent random state, the `drive.appdata`
 scope, offline access, and `consent select_account`. Both requests use the same
 loopback redirect URI. The listener polls cancellation every 100 ms for up to five
-minutes. Connections have bounded reads (8 KiB), a two-second lifetime, and 100 ms
-read/write timeouts. Unrelated paths are ignored; callback parameters must be
-unique and state must match, including denial callbacks. Callback pages are static.
+minutes. Connections have bounded reads (8 KiB), a 500 ms lifetime, and 100 ms
+read/write timeouts. Invalid requests receive 400 without ending sign-in; callback
+parameters must be unique and state must match, including denial callbacks.
+Cancellation returns `Ok(None)`; timeout has a plain error message. Callback pages
+are static.
 The code exchange includes the Desktop client secret, which is not confidential.
-A refresh token and an account from `about.get` (permission id and email) are
-required. Listener ownership guarantees closure on success and all failures.
+The granted scope must include `drive.appdata`. A refresh token and an account
+from `about.get` (permission id and email) are required. Listener ownership guarantees closure on success and all failures.
 
 `Secret` redacts Debug and exposes its value only explicitly for credential storage.
 The crate never persists tokens; access tokens live only in memory and refresh
 30 seconds early. Credentials, codes, server response text, and request URLs are
 never interpolated into errors. One 401 triggers one refresh and one retry.
-`invalid_grant` becomes `Error::AuthRequired`; other remote failures use retryable
-`Error::Remote`. Rate-limit 403 reasons and 429 report that Drive is busy; full
+A second 401, `invalid_grant`, rejected client/scope configuration, and permission
+or domain-policy denials become `Error::AuthRequired` with actionable messages.
+Other remote failures use `Error::Remote`. Rate-limit 403 reasons and 429 report that Drive is busy; full
 storage and disabled API errors have specific messages. There are no backoff loops:
 the next scheduled sync retries. Quotas include request-rate limits and the user's
 storage limit; retained immutable history grows until a future pruning design.
@@ -355,16 +359,20 @@ The first listing obtains a changes start token **before** fully paginating file
 Later listings paginate changes, including removals/trashing, and retain the new
 start token. Index and cursor changes commit together after the last page, so
 partial failures are retryable. Rejected change tokens (400/410) trigger one fresh
-bootstrap. Each listing returns the entire indexed key set, keeping failed reads
+bootstrap. A full enumeration also runs after six hours to recover consistency gaps
+between files and changes. Each listing returns the entire indexed key set, keeping failed reads
 eligible for retry. The index lasts for the lifetime of the `Drive` instance.
 Deleting the app folder in Google does not delete local data: there are no remote
 file-deletion tombstones for local records. Re-selecting the target resets export
 progress and can republish local revision history.
 
+The Google OAuth consent screen must be **In production**. Leaving it in
+**Testing** expires refresh tokens after seven days and forces weekly sign-in.
+
 ### Manual sign-in check
 
 Enable the Drive API in a Google Cloud project, configure its OAuth consent screen
-(and test user if in testing), create an OAuth **Desktop app** client, and download
+as **In production**, create an OAuth **Desktop app** client, and download
 its client JSON to `~/.config/tinytrac/google-client.json`. Run:
 
 ```sh

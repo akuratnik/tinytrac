@@ -27,16 +27,19 @@ struct User {
     permission_id: String,
 }
 
+const SCOPE: &str = "https://www.googleapis.com/auth/drive.appdata";
+
 const POLL: Duration = Duration::from_millis(100);
 
 /// Signs in using a temporary IPv4 loopback listener and PKCE. Call on a worker thread.
 /// The browser launcher must return promptly, without waiting for the browser to exit.
+/// Returns `Ok(None)` when cancelled.
 pub fn authorize(
     client: &Client,
     endpoints: &Endpoints,
     cancel: &AtomicBool,
     open_browser: impl FnOnce(&str) -> io::Result<()>,
-) -> Result<Authorization> {
+) -> Result<Option<Authorization>> {
     authorize_with_timeout(
         client,
         endpoints,
@@ -62,7 +65,7 @@ pub(crate) fn authorize_with_timeout(
     cancel: &AtomicBool,
     open_browser: impl FnOnce(&str) -> io::Result<()>,
     timeout: Duration,
-) -> Result<Authorization> {
+) -> Result<Option<Authorization>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     listener.set_nonblocking(true)?;
     let redirect = format!(
@@ -77,7 +80,7 @@ pub(crate) fn authorize_with_timeout(
             ("response_type", "code"),
             ("client_id", &client.id),
             ("redirect_uri", &redirect),
-            ("scope", "https://www.googleapis.com/auth/drive.appdata"),
+            ("scope", SCOPE),
             ("access_type", "offline"),
             ("prompt", "consent select_account"),
             ("code_challenge", &challenge(&verifier)),
@@ -87,10 +90,12 @@ pub(crate) fn authorize_with_timeout(
     );
     let deadline = Instant::now() + timeout;
     if cancel.load(Ordering::Relaxed) {
-        return Err(http::remote("Google sign-in cancelled"));
+        return Ok(None);
     }
     open_browser(&url).map_err(|_| http::remote("Could not open the sign-in browser"))?;
-    let code = wait(&listener, &state, cancel, deadline)?;
+    let Some(code) = wait(&listener, &state, cancel, deadline)? else {
+        return Ok(None);
+    };
     drop(listener);
     let agent = http::agent();
     let tokens = http::token(
@@ -104,6 +109,16 @@ pub(crate) fn authorize_with_timeout(
             ("code_verifier", &verifier),
         ],
     )?;
+    if !tokens
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope.split_whitespace().any(|s| s == SCOPE))
+    {
+        return Err(tinytrac_engine::Error::AuthRequired(
+            "Google app-data access was not granted; sign in again and allow Drive app-data access"
+                .into(),
+        ));
+    }
     let refresh_token = tokens
         .refresh_token
         .filter(|t| !t.is_empty())
@@ -123,23 +138,23 @@ pub(crate) fn authorize_with_timeout(
     if about.user.permission_id.is_empty() || about.user.email_address.is_empty() {
         return Err(http::remote("Google returned no account identity"));
     }
-    Ok(Authorization {
+    Ok(Some(Authorization {
         account: Account {
             id: about.user.permission_id,
             email: about.user.email_address,
         },
         refresh_token: Secret::new(refresh_token),
-    })
+    }))
 }
 
-fn interrupted(cancel: &AtomicBool, deadline: Instant) -> Result<()> {
+fn interrupted(cancel: &AtomicBool, deadline: Instant) -> Result<bool> {
     if cancel.load(Ordering::Relaxed) {
-        return Err(http::remote("Google sign-in cancelled"));
+        return Ok(true);
     }
     if Instant::now() >= deadline {
         return Err(http::remote("Google sign-in timed out"));
     }
-    Ok(())
+    Ok(false)
 }
 
 fn wait(
@@ -147,9 +162,11 @@ fn wait(
     state: &str,
     cancel: &AtomicBool,
     deadline: Instant,
-) -> Result<String> {
+) -> Result<Option<String>> {
     loop {
-        interrupted(cancel, deadline)?;
+        if interrupted(cancel, deadline)? {
+            return Ok(None);
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 if let Some(request) = request(&mut stream, cancel, deadline)? {
@@ -165,8 +182,9 @@ fn wait(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
                             page.len()
                         );
-                        return result;
+                        return result.map(Some);
                     }
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL),
@@ -182,10 +200,12 @@ fn request(
 ) -> Result<Option<String>> {
     stream.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(POLL))?;
-    let connection_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+    let connection_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
     let mut bytes = Vec::new();
     while bytes.len() < 8192 && Instant::now() < connection_deadline {
-        interrupted(cancel, deadline)?;
+        if interrupted(cancel, deadline)? {
+            return Ok(None);
+        }
         let mut buffer = [0; 512];
         let remaining = (8192 - bytes.len()).min(buffer.len());
         match stream.read(&mut buffer[..remaining]) {
@@ -220,13 +240,11 @@ fn callback(request: &str, state: &str) -> Option<Result<String>> {
     let mut params = BTreeMap::new();
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
         if params.insert(key, value).is_some() {
-            return Some(Err(http::remote(
-                "Google sign-in callback has duplicate parameters",
-            )));
+            return None;
         }
     }
     if params.get("state").map(std::convert::AsRef::as_ref) != Some(state) {
-        return Some(Err(http::remote("Google sign-in state did not match")));
+        return None;
     }
     if let Some(error) = params.get("error") {
         return Some(Err(http::remote(if error == "access_denied" {
@@ -235,11 +253,8 @@ fn callback(request: &str, state: &str) -> Option<Result<String>> {
             "Google sign-in failed"
         })));
     }
-    Some(
-        params
-            .get("code")
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string)
-            .ok_or_else(|| http::remote("Google sign-in callback has no code")),
-    )
+    params
+        .get("code")
+        .filter(|v| !v.is_empty())
+        .map(|code| Ok(code.to_string()))
 }
