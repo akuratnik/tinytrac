@@ -830,5 +830,5 @@ fn folder_sync(engine: &mut Engine) -> tinytrac_engine::Result<tinytrac_engine::
         return Ok(tinytrac_engine::SyncRun::default());
     };
     let mut transport = tinytrac_engine::Folder::for_context(&context).unwrap();
-    engine.sync(&context, &mut transport)
+    engine.sync(&mut transport)
 }

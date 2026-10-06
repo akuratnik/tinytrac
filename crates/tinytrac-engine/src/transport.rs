@@ -14,6 +14,9 @@ use crate::{Error, Result, SyncContext, SyncTarget};
 /// Return [`Error::AuthRequired`] when credentials need user intervention; other
 /// failures are retryable issues. The engine performs no network I/O itself.
 pub trait Transport {
+    /// The immutable binding used to construct this transport.
+    fn context(&self) -> &SyncContext;
+
     /// Stores an immutable batch. Publishing the same batch twice is harmless.
     fn publish(&mut self, name: &str, bytes: &[u8]) -> Result<()>;
     /// Returns opaque read keys for batches published by other devices.
@@ -25,7 +28,7 @@ pub trait Transport {
 #[derive(Debug)]
 pub struct Folder {
     root: PathBuf,
-    device: String,
+    context: SyncContext,
 }
 
 impl Folder {
@@ -34,7 +37,7 @@ impl Folder {
         match context.target() {
             SyncTarget::Folder(root) => Some(Self {
                 root: root.clone(),
-                device: context.device().into(),
+                context: context.clone(),
             }),
             SyncTarget::Remote { .. } => None,
         }
@@ -42,8 +45,12 @@ impl Folder {
 }
 
 impl Transport for Folder {
+    fn context(&self) -> &SyncContext {
+        &self.context
+    }
+
     fn publish(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        let directory = self.root.join(&self.device);
+        let directory = self.root.join(self.context.device());
         fs::create_dir_all(&directory)?;
         let target = directory.join(name);
         let temporary = directory.join(format!("{}.tmp", Uuid::now_v7()));
@@ -69,7 +76,7 @@ impl Transport for Folder {
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() || entry.file_name() == self.device.as_str() {
+            if !entry.file_type()?.is_dir() || entry.file_name() == self.context.device() {
                 continue;
             }
             let device = entry

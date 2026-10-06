@@ -4,10 +4,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A remote transport failure that a later sync may retry.
+    #[error("{0}")]
+    Remote(String),
     #[error("authentication required: {0}")]
     AuthRequired(String),
     #[error("sync context is stale")]
     StaleSyncContext,
+    #[error("sync folder now resolves elsewhere; select it again")]
+    SyncFolderMoved,
     #[error("file I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid sync data: {0}")]

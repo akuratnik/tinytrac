@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tinytrac-core", "crates/tinytrac-engine", "crates/tinytrac"]
+members = ["crates/tinytrac-core", "crates/tinytrac-engine", "crates/tinytrac-drive", "crates/tinytrac"]
 
 [workspace.package]
 version = "0.1.0"

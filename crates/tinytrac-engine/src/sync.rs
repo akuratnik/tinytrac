@@ -19,10 +19,23 @@ use crate::{
 };
 
 /// Local destination identity. Remote labels are display-only.
+///
+/// The serde encoding is persisted in `meta.sync_target`; migration 004 depends on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncTarget {
     Folder(std::path::PathBuf),
     Remote { id: String, label: String },
+}
+
+impl SyncTarget {
+    /// Folder paths and remote ids define identity; display labels do not.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Folder(a), Self::Folder(b)) => a == b,
+            (Self::Remote { id: a, .. }, Self::Remote { id: b, .. }) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// An immutable transport binding obtained from [`crate::Engine::sync_context`].
@@ -361,9 +374,32 @@ mod tests {
     use crate::Engine;
     use tinytrac_core::Tag;
 
-    struct Publisher<F>(F);
+    #[test]
+    fn target_json_matches_the_persisted_migration_format() {
+        for (target, json) in [
+            (
+                SyncTarget::Folder("sync".into()),
+                serde_json::json!({"Folder": "sync"}),
+            ),
+            (
+                SyncTarget::Remote {
+                    id: "account".into(),
+                    label: "Personal".into(),
+                },
+                serde_json::json!({"Remote": {"id": "account", "label": "Personal"}}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&target).unwrap(), json);
+            assert_eq!(serde_json::from_value::<SyncTarget>(json).unwrap(), target);
+        }
+    }
+
+    struct Publisher<F>(F, SyncContext);
 
     impl<F: Fn(&[u8])> Transport for Publisher<F> {
+        fn context(&self) -> &SyncContext {
+            &self.1
+        }
         fn publish(&mut self, _: &str, bytes: &[u8]) -> Result<()> {
             self.0(bytes);
             Ok(())
@@ -379,11 +415,15 @@ mod tests {
     #[test]
     fn a_stale_epoch_stops_before_reading_or_parsing_more_files() {
         struct Switching<'a> {
+            context: SyncContext,
             engine: RefCell<&'a mut Engine>,
             reads: RefCell<usize>,
             during_list: bool,
         }
         impl Transport for Switching<'_> {
+            fn context(&self) -> &SyncContext {
+                &self.context
+            }
             fn publish(&mut self, _: &str, _: &[u8]) -> Result<()> {
                 Ok(())
             }
@@ -413,6 +453,7 @@ mod tests {
                 .unwrap();
             let selected = epoch(&db).unwrap();
             let mut transport = Switching {
+                context: engine.sync_context().unwrap().unwrap(),
                 engine: RefCell::new(&mut engine),
                 reads: RefCell::new(0),
                 during_list,
@@ -443,14 +484,17 @@ mod tests {
         }
         tx.commit().unwrap();
         let selected = epoch(&db).unwrap();
-        let mut switch = Publisher(|_: &[u8]| {
-            // A second writer can commit while publication is in progress.
-            let mut other = Engine::open(&path).unwrap();
-            other.create_tag("During publication").unwrap();
-            other
-                .set_sync_target(Some(SyncTarget::Folder(root.path().join("new"))))
-                .unwrap();
-        });
+        let mut switch = Publisher(
+            |_: &[u8]| {
+                // A second writer can commit while publication is in progress.
+                let mut other = Engine::open(&path).unwrap();
+                other.create_tag("During publication").unwrap();
+                other
+                    .set_sync_target(Some(SyncTarget::Folder(root.path().join("new"))))
+                    .unwrap();
+            },
+            engine.sync_context().unwrap().unwrap(),
+        );
         assert_eq!(export(&mut db, selected, &mut switch).unwrap(), 0);
         let pending: i64 = db
             .query_row(
@@ -461,10 +505,13 @@ mod tests {
             .unwrap();
         assert_eq!(pending, 1002);
         let sizes = RefCell::new(Vec::new());
-        let mut publisher = Publisher(|bytes: &[u8]| {
-            let batch: Batch<Vec<&RawValue>> = serde_json::from_slice(bytes).unwrap();
-            sizes.borrow_mut().push(batch.changes.len());
-        });
+        let mut publisher = Publisher(
+            |bytes: &[u8]| {
+                let batch: Batch<Vec<&RawValue>> = serde_json::from_slice(bytes).unwrap();
+                sizes.borrow_mut().push(batch.changes.len());
+            },
+            engine.sync_context().unwrap().unwrap(),
+        );
         assert_eq!(export(&mut db, selected, &mut publisher).unwrap(), 0);
         let selected = epoch(&db).unwrap();
         assert_eq!(export(&mut db, selected, &mut publisher).unwrap(), 1002);

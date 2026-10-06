@@ -1,11 +1,12 @@
 # Architecture
 
-tinytrac is a Cargo workspace with three crates, each depending only on the one before it:
+tinytrac is a Cargo workspace with four crates. The engine depends on core; Drive and the app depend on the engine:
 
 | Crate | Role | Status |
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
 | `tinytrac-engine` | SQLite storage, commands, queries and transport-independent sync. | done |
+| `tinytrac-drive` | Blocking Google OAuth and Drive app-data transport. | done; app wiring next |
 | `tinytrac` | Desktop app ([iced](https://iced.rs)) with system tray. | done |
 
 The rules live in `core`, where they are tested without a database or a window.
@@ -145,23 +146,23 @@ database, including through symlinks.
 Create a fresh database on each device: copying a database also copies its device
 id and must not be used to provision another writer.
 
-`Transport` is a public, mutable interface: `publish(name, bytes)` stores an
+`Transport` is a public, mutable interface: `context()` returns its immutable
+binding; `publish(name, bytes)` stores an
 immutable batch and publishing the same batch twice is harmless; `list()` returns
 stable opaque read keys for batches from other devices; `read(key)` retrieves the
 immutable bytes. Keys need not match publish names (remote file ids are valid).
 Implementations must never reuse a key for different bytes. Mutable methods allow
 credential refresh and caches without a `Sync` bound or internal mutex. The engine
 does no networking. `Folder::for_context` constructs the std-only folder transport
-and returns `None` for remote targets; a later crate will supply Google Drive.
+and returns `None` for remote targets; `tinytrac-drive` supplies Google Drive.
 `sync.rs` coordinates import/export, `store.rs` provides typed storage and timer
 repair, and `revisions.rs` owns validation, head computation and materialized
 winners. These layers share no reverse dependencies.
 
 `Engine::sync_context()` captures target, epoch and device together in a read
 transaction. Its immutable `SyncContext` binds caller-created transports to that
-selection. `Engine::sync(&context, &mut transport)` rejects stale contexts before
-transport I/O, including A -> B -> A switches. Callers must build the transport for
-the supplied context. Folder runs re-resolve the path and check database containment
+selection. `Engine::sync(&mut transport)` reads the transport's context and rejects
+stale epochs or target identities before transport I/O, including A -> B -> A switches. Folder runs re-resolve the path and check database containment
 before I/O; a changed canonical path requires selecting the target again.
 
 Files are `<device>/<last-seq:020>-<uuidv7>.json`, containing format
@@ -248,9 +249,11 @@ further settlement converge once the same history has arrived. A further exchang
 of a settled history creates no new revisions.
 
 The app requests sync at startup, after saved commands and every 30 seconds. At boot it opens
-one second `Engine` for file databases and retains it with an optional `(SyncContext, Folder)` transport cache in one worker
+one second `Engine` for file databases and retains it with an optional `Folder` transport cache in one worker
 for the app's lifetime. An `Arc<Mutex<Worker>>` moves serialized work between
-threads; transport state survives runs and is dropped when the context changes.
+threads; transport state survives runs and label changes, and is dropped when the
+target identity or epoch changes. A stale-context race returns an empty run without
+a problem banner; the queued rerun uses the current target.
 Worker threads use that engine; ordinary commands and native
 tray operations stay on the UI thread. One sync runs at a time; requests during a run
 queue exactly one rerun. Completion returns a cloneable `Message::Synced` with cloneable errors that preserve the authentication-required variant, updates status, and reloads data and report caches. In-memory
@@ -283,3 +286,72 @@ beyond the backup. Never run two writers with a copied device identity.
   logged time".
 - `crates/tinytrac-engine/tests/engine.rs` drives the engine through its public
   API with a controllable clock.
+
+## Google Drive (`tinytrac-drive`)
+
+This blocking crate implements `Transport` on the sync worker thread. It owns one
+reused ureq Agent with rustls, a 10-second connect timeout and a 120-second overall
+request timeout, including response bodies. It has no async runtime or Google SDK.
+The app will supply a Desktop OAuth `Client`, launch the system browser, and store
+the refresh token in its keychain; settings and worker integration are a next step.
+
+`authorize` binds `127.0.0.1:0` before launching the browser. It uses a random
+32-byte PKCE verifier (S256), an independent random state, the `drive.appdata`
+scope, offline access, and `consent select_account`. Both requests use the same
+loopback redirect URI. The listener polls cancellation every 100 ms for up to five
+minutes. Connections have bounded reads (8 KiB), a two-second lifetime, and 100 ms
+read/write timeouts. Unrelated paths are ignored; callback parameters must be
+unique and state must match, including denial callbacks. Callback pages are static.
+The code exchange includes the Desktop client secret, which is not confidential.
+A refresh token and an account from `about.get` (permission id and email) are
+required. Listener ownership guarantees closure on success and all failures.
+
+`Secret` redacts Debug and exposes its value only explicitly for credential storage.
+The crate never persists tokens; access tokens live only in memory and refresh
+30 seconds early. Credentials, codes, server response text, and request URLs are
+never interpolated into errors. One 401 triggers one refresh and one retry.
+`invalid_grant` becomes `Error::AuthRequired`; other remote failures use retryable
+`Error::Remote`. Rate-limit 403 reasons and 429 report that Drive is busy; full
+storage and disabled API errors have specific messages. There are no backoff loops:
+the next scheduled sync retries. Quotas include request-rate limits and the user's
+storage limit; retained immutable history grows until a future pruning design.
+
+Uploads create a resumable session, then PUT the complete batch, of arbitrary
+in-memory size. Only a final 200/201 acknowledges publication; interrupted uploads
+are republished next run and revisions deduplicate. Session URLs must remain on
+the configured Drive origin. Labels are `<device>/<batch name>`; the slash creates
+no directory. Labels require a non-empty device and JSON filename; batch validation
+belongs to the engine. Only other devices' labels enter the index. Read
+keys are Drive file ids, not names. Files are in the private `appDataFolder` space.
+
+The first listing obtains a changes start token **before** fully paginating files.
+Later listings paginate changes, including removals/trashing, and retain the new
+start token. Index and cursor changes commit together after the last page, so
+partial failures are retryable. Rejected change tokens (400/410) trigger one fresh
+bootstrap. Each listing returns the entire indexed key set, keeping failed reads
+eligible for retry. The index lasts for the lifetime of the `Drive` instance.
+Deleting the app folder in Google does not delete local data: there are no remote
+file-deletion tombstones for local records. Re-selecting the target resets export
+progress and can republish local revision history.
+
+### Manual sign-in check
+
+Enable the Drive API in a Google Cloud project, configure its OAuth consent screen
+(and test user if in testing), create an OAuth **Desktop app** client, and download
+its client JSON to `~/.config/tinytrac/google-client.json`. Run:
+
+```sh
+cargo run -p tinytrac-drive --example sign_in
+# Or choose the downloaded client file explicitly:
+TINYTRAC_GOOGLE_CLIENT=/path/to/client.json cargo run -p tinytrac-drive --example sign_in
+```
+
+The helper launches the system browser, prints only the account email and existing
+batch ids, and drops credentials at exit. It does not upload or store a refresh
+token. Re-running asks for consent again. Tests use a std loopback fake Google
+server and independent SQLite databases; they require no Google account or internet.
+
+References: [installed-app OAuth](https://developers.google.com/identity/protocols/oauth2/native-app),
+[app data](https://developers.google.com/workspace/drive/api/guides/appdata),
+[changes start token](https://developers.google.com/workspace/drive/api/reference/rest/v3/changes/getStartPageToken),
+and [ureq timeouts](https://docs.rs/ureq/3.4.2/ureq/config/struct.ConfigBuilder.html).

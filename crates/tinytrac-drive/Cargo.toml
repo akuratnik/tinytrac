@@ -1,0 +1,31 @@
+[package]
+name = "tinytrac-drive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Shared transport contract and retryable/authentication errors.
+tinytrac-engine.workspace = true
+# Blocking HTTP with pooled connections and rustls; no compression or async runtime.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+# Typed Google wire responses.
+serde.workspace = true
+# JSON metadata and response decoding.
+serde_json.workspace = true
+# PKCE S256 challenge.
+sha2 = { version = "0.11", default-features = false }
+# OS randomness for independent verifier and CSRF state.
+getrandom = "0.4"
+# RFC 7636 URL-safe, unpadded encoding.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+# OAuth forms and query strings without hand-rolled escaping.
+form_urlencoded = "1.2"
+
+[dev-dependencies]
+# Isolated engine databases for convergence tests.
+tempfile.workspace = true
+
+[lints]
+workspace = true

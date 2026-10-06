@@ -6,7 +6,7 @@ use std::{
 };
 
 use iced::Task;
-use tinytrac_engine::{Engine, Folder, SyncContext, SyncRun};
+use tinytrac_engine::{Engine, Folder, SyncContext, SyncRun, Transport};
 
 use super::Message;
 use crate::{data::Data, screen};
@@ -29,6 +29,7 @@ impl From<tinytrac_engine::Error> for Failure {
     }
 }
 
+#[cfg(test)]
 impl From<&str> for Failure {
     fn from(message: &str) -> Self {
         Self::Other(message.into())
@@ -183,27 +184,61 @@ impl SyncProblems {
 
 /// Retains transport caches between serialized runs, bound to one context.
 #[derive(Debug)]
-struct Worker {
+struct Worker<T = Folder> {
     engine: Engine,
-    transport: Option<(SyncContext, Folder)>,
+    transport: Option<T>,
 }
 
 impl Worker {
     fn run(&mut self) -> tinytrac_engine::Result<SyncRun> {
+        self.run_with(|context| {
+            Folder::for_context(context).ok_or_else(|| {
+                tinytrac_engine::Error::Sync("remote transport is not available".into())
+            })
+        })
+    }
+}
+
+impl<T: Transport> Worker<T> {
+    fn run_with(
+        &mut self,
+        build: impl FnOnce(&SyncContext) -> tinytrac_engine::Result<T>,
+    ) -> tinytrac_engine::Result<SyncRun> {
         let context = self.engine.sync_context()?;
-        if self.transport.as_ref().map(|(context, _)| context) != context.as_ref() {
+        self.prepare(context.as_ref(), build)?;
+        self.sync()
+    }
+
+    fn prepare(
+        &mut self,
+        context: Option<&SyncContext>,
+        build: impl FnOnce(&SyncContext) -> tinytrac_engine::Result<T>,
+    ) -> tinytrac_engine::Result<()> {
+        let reusable = self
+            .transport
+            .as_ref()
+            .zip(context)
+            .is_some_and(|(transport, context)| {
+                transport.context().epoch() == context.epoch()
+                    && transport.context().target().same_identity(context.target())
+            });
+        if !reusable {
             self.transport = None;
             if let Some(context) = context {
-                let transport = Folder::for_context(&context).ok_or_else(|| {
-                    tinytrac_engine::Error::Sync("remote transport is not available".into())
-                })?;
-                self.transport = Some((context, transport));
+                self.transport = Some(build(context)?);
             }
         }
-        let Some((context, transport)) = &mut self.transport else {
+        Ok(())
+    }
+
+    fn sync(&mut self) -> tinytrac_engine::Result<SyncRun> {
+        let Some(transport) = &mut self.transport else {
             return Ok(SyncRun::default());
         };
-        self.engine.sync(context, transport)
+        match self.engine.sync(transport) {
+            Err(tinytrac_engine::Error::StaleSyncContext) => Ok(SyncRun::default()),
+            result => result,
+        }
     }
 }
 
@@ -223,6 +258,110 @@ async fn blocking<T: Send + 'static>(
 mod tests {
     use super::*;
     use tinytrac_engine::{SyncIssue, SyncTarget};
+
+    #[derive(Debug)]
+    struct Cached {
+        context: SyncContext,
+        lists: usize,
+        drops: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Drop for Cached {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    impl Transport for Cached {
+        fn context(&self) -> &SyncContext {
+            &self.context
+        }
+        fn publish(&mut self, _: &str, _: &[u8]) -> tinytrac_engine::Result<()> {
+            Ok(())
+        }
+        fn list(&mut self) -> tinytrac_engine::Result<Vec<String>> {
+            self.lists += 1;
+            Ok(Vec::new())
+        }
+        fn read(&mut self, _: &str) -> tinytrac_engine::Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn worker_preserves_caches_until_identity_or_epoch_changes() {
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let build = |context: &SyncContext| {
+            Ok(Cached {
+                context: context.clone(),
+                lists: 0,
+                drops: drops.clone(),
+            })
+        };
+        let mut worker = Worker {
+            engine: Engine::open_in_memory().unwrap(),
+            transport: None,
+        };
+        let remote = |id: &str, label: &str| {
+            Some(SyncTarget::Remote {
+                id: id.into(),
+                label: label.into(),
+            })
+        };
+        worker.engine.set_sync_target(remote("a", "Old")).unwrap();
+        worker.run_with(build).unwrap();
+        worker.run_with(build).unwrap();
+        assert_eq!(worker.transport.as_ref().unwrap().lists, 2);
+        worker.engine.set_sync_target(remote("a", "New")).unwrap();
+        worker.run_with(build).unwrap();
+        assert_eq!(worker.transport.as_ref().unwrap().lists, 3);
+        assert_eq!(drops.get(), 0);
+        worker.engine.set_sync_target(remote("b", "New")).unwrap();
+        worker.run_with(build).unwrap();
+        assert_eq!(worker.transport.as_ref().unwrap().lists, 1);
+        assert_eq!(drops.get(), 1);
+        worker.engine.set_sync_target(None).unwrap();
+        worker.engine.set_sync_target(remote("b", "New")).unwrap();
+        worker.run_with(build).unwrap();
+        assert_eq!(drops.get(), 2);
+        worker.engine.set_sync_target(None).unwrap();
+        worker.run_with(build).unwrap();
+        assert!(worker.transport.is_none());
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn target_race_returns_an_empty_run_without_a_banner() {
+        let mut engine = Engine::open_in_memory().unwrap();
+        engine
+            .set_sync_target(Some(SyncTarget::Remote {
+                id: "a".into(),
+                label: "A".into(),
+            }))
+            .unwrap();
+        let mut worker = Worker {
+            engine,
+            transport: None,
+        };
+        let context = worker.engine.sync_context().unwrap().unwrap();
+        let build = |context: &SyncContext| {
+            Ok(Cached {
+                context: context.clone(),
+                lists: 0,
+                drops: std::rc::Rc::new(std::cell::Cell::new(0)),
+            })
+        };
+        worker.prepare(Some(&context), build).unwrap();
+        worker.engine.set_sync_target(None).unwrap();
+        let run = worker.sync().unwrap();
+        assert_eq!(run, SyncRun::default());
+        let data = Data::load(&worker.engine).unwrap();
+        let mut state = State::new(&worker.engine, &data).unwrap();
+        let now = "2026-10-06T12:00:00[UTC]".parse::<jiff::Zoned>().unwrap();
+        assert!(state.finish(&Ok(run), &data, &now).0.is_none());
+        worker.run_with(build).unwrap();
+        assert!(worker.transport.is_none());
+    }
 
     #[test]
     fn incomplete_and_failed_runs_keep_the_last_clean_time() {

@@ -222,12 +222,22 @@ impl Engine {
             *path = std::fs::canonicalize(&*path)?;
             self.check_sync_folder(path)?;
         }
+        if let Some(SyncTarget::Remote { id, .. }) = &target
+            && id.trim().is_empty()
+        {
+            return Err(Error::Sync("remote target id must not be empty".into()));
+        }
         let value = target.as_ref().map(serde_json::to_string).transpose()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = read_target(&tx)?;
-        if !same_target(previous.as_ref(), target.as_ref()) {
+        let unchanged = match (&previous, &target) {
+            (Some(a), Some(b)) => a.same_identity(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
             if target.is_some() {
                 tx.execute_batch("UPDATE changes SET exported = 0; DELETE FROM imported_files;")?;
             }
@@ -257,27 +267,22 @@ impl Engine {
         })
     }
 
-    /// Runs a transport built for this context. A stale context fails before I/O.
+    /// Runs a transport using its bound context. A stale context fails before I/O.
     /// Epoch checks also guard publication acknowledgements and import commits.
-    pub fn sync(
-        &mut self,
-        context: &SyncContext,
-        transport: &mut (impl Transport + ?Sized),
-    ) -> Result<crate::SyncRun> {
+    pub fn sync(&mut self, transport: &mut (impl Transport + ?Sized)) -> Result<crate::SyncRun> {
+        let context = transport.context();
         let current = self.sync_context()?;
         if !current.as_ref().is_some_and(|current| {
-            current.epoch == context.epoch
-                && current.device == context.device
-                && same_target(Some(&current.target), Some(&context.target))
+            current.epoch == context.epoch && current.target.same_identity(&context.target)
         }) {
             return Err(Error::StaleSyncContext);
         }
         if let SyncTarget::Folder(path) = &context.target {
             let root = std::fs::canonicalize(path)?;
-            self.check_sync_folder(&root)?;
             if &root != path {
-                return Err(Error::StaleSyncContext);
+                return Err(Error::SyncFolderMoved);
             }
+            self.check_sync_folder(&root)?;
         }
         crate::sync::run(&mut self.db, &self.device, context.epoch, transport)
     }
@@ -419,15 +424,6 @@ fn read_target(db: &Connection) -> Result<Option<SyncTarget>> {
     value
         .map(|value| serde_json::from_str(&value).map_err(Error::from))
         .transpose()
-}
-
-fn same_target(a: Option<&SyncTarget>, b: Option<&SyncTarget>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(SyncTarget::Folder(a)), Some(SyncTarget::Folder(b))) => a == b,
-        (Some(SyncTarget::Remote { id: a, .. }), Some(SyncTarget::Remote { id: b, .. })) => a == b,
-        _ => false,
-    }
 }
 
 #[cfg(test)]
