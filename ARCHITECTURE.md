@@ -5,7 +5,7 @@ tinytrac is a Cargo workspace with three crates, each depending only on the one 
 | Crate | Role | Status |
 |---|---|---|
 | `tinytrac-core` | Domain rules: tags, timers, break bank, reports. No I/O; time is passed in. | done |
-| `tinytrac-engine` | SQLite storage, commands, queries and folder sync. | done |
+| `tinytrac-engine` | SQLite storage, commands, queries and transport-independent sync. | done |
 | `tinytrac` | Desktop app ([iced](https://iced.rs)) with system tray. | done |
 
 The rules live in `core`, where they are tested without a database or a window.
@@ -82,7 +82,8 @@ database from a newer version is refused rather than risk damaging it. Migration
 003 adds durable rejection diagnostics, a sync epoch and lookup indexes, clears
 imported filenames once to reinspect files older clients swallowed, and runs the
 Rust duplicate repair in the migration transaction. Opening an up-to-date database
-does not write repairs. Write
+does not write repairs. Migration 004 converts `meta.sync_folder` to a serialized
+`SyncTarget` without touching exported flags, imported keys or the epoch. Write
 transactions take the lock up front (`BEGIN IMMEDIATE`) and wait at most two
 seconds for another writer.
 Settings (break bank on/off and ratio, week start) are a synced record.
@@ -136,37 +137,59 @@ headlessly: they click buttons by label and check what is on screen. Setting
 ## Sync
 
 Each device has its own database and a persistent device id. Configure a shared
-folder in Settings; Syncthing replicates that folder between devices. Its path is
-local metadata, never part of the synced settings record. The engine resolves
-paths and refuses a folder containing its database, including through symlinks.
+folder in Settings; Syncthing replicates that folder between devices. `SyncTarget`
+is either a folder path or a remote target with a caller-chosen stable, opaque id
+and a display-only label. Targets are local metadata, never part of the synced
+settings record. The engine resolves paths and refuses a folder containing its
+database, including through symlinks.
 Create a fresh database on each device: copying a database also copies its device
 id and must not be used to provision another writer.
 
-`transport.rs` defines three operations: publish, list, and read batches. Its only
-implementation is the folder. `sync.rs` coordinates import/export, `store.rs`
-provides typed storage and timer repair, and `revisions.rs` owns validation,
-head computation and materialized winners. These layers share no reverse dependencies.
+`Transport` is a public, mutable interface: `publish(name, bytes)` stores an
+immutable batch and publishing the same batch twice is harmless; `list()` returns
+stable opaque read keys for batches from other devices; `read(key)` retrieves the
+immutable bytes. Keys need not match publish names (remote file ids are valid).
+Implementations must never reuse a key for different bytes. Mutable methods allow
+credential refresh and caches without a `Sync` bound or internal mutex. The engine
+does no networking. `Folder::for_context` constructs the std-only folder transport
+and returns `None` for remote targets; a later crate will supply Google Drive.
+`sync.rs` coordinates import/export, `store.rs` provides typed storage and timer
+repair, and `revisions.rs` owns validation, head computation and materialized
+winners. These layers share no reverse dependencies.
+
+`Engine::sync_context()` captures target, epoch and device together in a read
+transaction. Its immutable `SyncContext` binds caller-created transports to that
+selection. `Engine::sync(&context, &mut transport)` rejects stale contexts before
+transport I/O, including A -> B -> A switches. Callers must build the transport for
+the supplied context. Folder runs re-resolve the path and check database containment
+before I/O; a changed canonical path requires selecting the target again.
+
 Files are `<device>/<last-seq:020>-<uuidv7>.json`, containing format
 version 1 and an array of changes. **Any batch-format change bumps the version.**
 Publication writes and fsyncs a temporary file in the same directory, renames it,
 and on Unix fsyncs the directories. Unique names allow sequence reuse after backup
-restore. Export selects at most 1000 pending revisions and the folder's `sync_epoch`
+restore. Export selects at most 1000 pending revisions and the target's `sync_epoch`
 in a read transaction, releases it for publication, then marks exactly those
 revisions in a short IMMEDIATE transaction only if the epoch is unchanged. It loops
 until no pending revisions remain. A crash after publication can republish revisions;
-revision ids make this harmless. Export errors do not prevent imports.
+revision ids make this harmless. Ordinary export errors do not prevent imports.
 
-Changing the canonical sync folder atomically stores the path, resets all revisions
-(including other devices' revisions) to unexported, clears imported filenames, and
-increments `sync_epoch`. Re-selecting the same folder is a no-op. Clearing and
-re-setting republishes history. A sync already publishing to the old folder cannot
-mark revisions or import file markers for the new epoch. Imported revisions normally
+Selecting a different target identity (canonical folder path or remote id)
+atomically stores the target, resets all revisions (including other devices'
+revisions) to unexported, clears imported keys, and increments `sync_epoch`.
+Disabling invalidates the epoch but retains diagnostics until a target is selected
+again, matching the existing folder behavior. Re-selecting the same identity
+preserves progress; a remote label-only change updates its display without
+invalidating existing contexts. Clearing and re-setting
+republishes history. A sync already publishing to the old target cannot mark
+revisions or import markers for the new epoch. Imported revisions normally
 arrive with `exported = 1`, so ordinary syncs export only locally written changes.
 
-Imports remember individual filenames in `imported_files`, allowing late arrivals.
-Non-JSON filenames are ignored. The epoch is checked before reading and parsing
-each file; importing stops when it becomes stale. The envelope version is checked before interpreting
-its payload; unsupported versions remain retryable with an update-device notice.
+Imports remember opaque read keys in `imported_files`, allowing late arrivals.
+Only the folder transport filters non-JSON filenames; remote keys have no
+extension requirement. The epoch is checked before reading and parsing each file;
+importing stops when it becomes stale. The envelope version is checked before
+interpreting its payload; unsupported versions remain retryable with an update-device notice.
 Each change is decoded separately from borrowed `RawValue`, without a whole-batch
 JSON value tree. Each file uses one transaction and a savepoint per change. Invalid
 ids, bodies or kinds roll back only that change. Kind validation reads history,
@@ -185,6 +208,12 @@ files. `SyncDiagnostics` exposes the durable sum and latest reason independently
 JSON is permanent except for unexpected EOF, which may mean a partial copy. Read
 failures, truncated files, unsupported versions and database failures remain retryable
 in the current report's `skipped` list. Counts are exposed only after commit.
+`Error::AuthRequired` signals missing, expired or revoked credentials requiring
+user intervention. From publish, list or read it aborts the run as a distinct error,
+not a skipped issue. A failed read never marks its key imported or rejected, and a
+failed publish never acknowledges its revisions. Earlier committed batches remain
+committed. Other export failures still allow import; other per-key read failures
+remain retryable skipped issues.
 Imports preserve each revision, parent, merge reference and device. Bodies deserialize
 through core invariants, ids must match, and kinds cannot change, even after deletion.
 Revisions must be canonical UUIDv7 strings.
@@ -219,17 +248,22 @@ further settlement converge once the same history has arrived. A further exchang
 of a settled history creates no new revisions.
 
 The app requests sync at startup, after saved commands and every 30 seconds. At boot it opens
-one second `Engine` for file databases and retains it in `Arc<Mutex<Engine>>` for
-the app's lifetime. Worker threads use that engine; ordinary commands and native
+one second `Engine` for file databases and retains it with an optional `(SyncContext, Folder)` transport cache in one worker
+for the app's lifetime. An `Arc<Mutex<Worker>>` moves serialized work between
+threads; transport state survives runs and is dropped when the context changes.
+Worker threads use that engine; ordinary commands and native
 tray operations stay on the UI thread. One sync runs at a time; requests during a run
-queue exactly one rerun. Completion returns a cloneable `Message::Synced` with errors
-converted to strings, updates status, and reloads data and report caches. In-memory
+queue exactly one rerun. Completion returns a cloneable `Message::Synced` with cloneable errors that preserve the authentication-required variant, updates status, and reloads data and report caches. In-memory
 engines never sync. Iced 0.14 does not export `task::blocking`, so a standard thread
-and iced's futures channel provide the same task delivery without another dependency.
+and iced's futures channel, wrapped in a small blocking helper, provide the same
+task delivery without another dependency.
 
 Settings shows durable rejections and current conflicts only when nonzero, alongside
-the last run's timestamped status (or Sync disabled). The main error banner appears when the rejected total grows or a
-new transient problem appears; whole-sync errors count as transient.
+the last run's timestamped status: Synced, Sync incomplete with skipped issues,
+or Sync failed with the error (or Sync disabled). When the latest run is not clean,
+the last successful sync time is shown separately if one is known. Remote targets
+show their display label; this step adds no remote setup UI. The main error banner
+appears when the rejected total grows or a new transient problem appears; whole-sync errors count as transient.
 The rejected baseline is seeded from the initial snapshot, so old rejections do
 not raise a banner on launch. Banners describe only new problems. Problem identity
 excludes timestamps, so dismissing a repeated issue sticks.

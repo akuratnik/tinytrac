@@ -379,15 +379,17 @@ fn old_rejections_do_not_raise_a_banner_after_launch() {
     let peer = folder.join("peer");
     std::fs::create_dir_all(&peer).unwrap();
     let mut engine = Engine::open(directory.join("db")).unwrap();
-    engine.set_sync_folder(&folder).unwrap();
+    engine
+        .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&folder).into())))
+        .unwrap();
     std::fs::write(peer.join("bad.json"), "bad JSON").unwrap();
-    engine.sync().unwrap();
+    folder_sync(&mut engine).unwrap();
     let mut app = App::new(engine).unwrap();
     assert_eq!(app.sync.problems.rejected, 1);
     let _ = app.update(Message::Synced(Ok(SyncRun::default())));
     assert!(app.error.is_none());
     std::fs::write(peer.join("new.json"), "bad JSON").unwrap();
-    let run = app.engine.sync().unwrap();
+    let run = folder_sync(&mut app.engine).unwrap();
     let _ = app.update(Message::Synced(Ok(run)));
     assert_eq!(app.error.as_deref(), Some("1 new change was rejected"));
     assert!(!app.sync.status.contains("rejected"));
@@ -398,9 +400,13 @@ fn old_rejections_do_not_raise_a_banner_after_launch() {
     assert!(app.error.is_none());
     let _ = app.update(Message::Synced(Err("unavailable".into())));
     assert!(app.sync.status.starts_with("Sync failed at "));
-    assert!(app.sync.status.ends_with(": unavailable"));
+    assert!(
+        app.sync
+            .status
+            .contains(": unavailable\nLast successful sync at ")
+    );
     assert_eq!(app.error.as_deref(), Some("unavailable"));
-    app.engine.clear_sync_folder().unwrap();
+    app.engine.set_sync_target(None).unwrap();
     let _ = app.update(Message::Synced(Ok(SyncRun::default())));
     assert_eq!(app.sync.status, "Sync disabled");
     drop(app);
@@ -458,4 +464,12 @@ fn sync_requests_coalesce_and_only_successful_commands_request_sync() {
     h.create_tag("In memory");
     assert_eq!(h.app.update(Message::Refresh).units(), 0);
     assert!(!h.app.sync.syncing);
+}
+
+fn folder_sync(engine: &mut Engine) -> tinytrac_engine::Result<tinytrac_engine::SyncRun> {
+    let Some(context) = engine.sync_context()? else {
+        return Ok(tinytrac_engine::SyncRun::default());
+    };
+    let mut transport = tinytrac_engine::Folder::for_context(&context).unwrap();
+    engine.sync(&context, &mut transport)
 }

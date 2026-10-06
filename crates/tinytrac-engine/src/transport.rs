@@ -4,21 +4,45 @@ use std::{fs, io::Write, path::PathBuf};
 
 use uuid::Uuid;
 
-use crate::{Error, Result};
+use crate::{Error, Result, SyncContext, SyncTarget};
 
-pub(crate) trait Transport {
-    fn publish(&self, name: &str, bytes: &[u8]) -> Result<()>;
-    fn list(&self) -> Result<Vec<String>>;
-    fn read(&self, name: &str) -> Result<Vec<u8>>;
+/// Exchanges immutable batches for one target and device.
+///
+/// Implementations exclude this device's batches from listings. Read keys must be
+/// stable and unique within the target, but need not equal publication names
+/// (a remote service may use file ids). Never reuse a key for different bytes.
+/// Return [`Error::AuthRequired`] when credentials need user intervention; other
+/// failures are retryable issues. The engine performs no network I/O itself.
+pub trait Transport {
+    /// Stores an immutable batch. Publishing the same batch twice is harmless.
+    fn publish(&mut self, name: &str, bytes: &[u8]) -> Result<()>;
+    /// Returns opaque read keys for batches published by other devices.
+    fn list(&mut self) -> Result<Vec<String>>;
+    /// Returns the immutable bytes associated with a listed read key.
+    fn read(&mut self, key: &str) -> Result<Vec<u8>>;
 }
 
-pub(crate) struct Folder {
-    pub root: PathBuf,
-    pub device: String,
+#[derive(Debug)]
+pub struct Folder {
+    root: PathBuf,
+    device: String,
+}
+
+impl Folder {
+    /// Builds a folder transport, or returns `None` for a remote target.
+    pub fn for_context(context: &SyncContext) -> Option<Self> {
+        match context.target() {
+            SyncTarget::Folder(root) => Some(Self {
+                root: root.clone(),
+                device: context.device().into(),
+            }),
+            SyncTarget::Remote { .. } => None,
+        }
+    }
 }
 
 impl Transport for Folder {
-    fn publish(&self, name: &str, bytes: &[u8]) -> Result<()> {
+    fn publish(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         let directory = self.root.join(&self.device);
         fs::create_dir_all(&directory)?;
         let target = directory.join(name);
@@ -41,7 +65,7 @@ impl Transport for Folder {
         result
     }
 
-    fn list(&self) -> Result<Vec<String>> {
+    fn list(&mut self) -> Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -66,8 +90,8 @@ impl Transport for Folder {
         Ok(names)
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
-        Ok(fs::read(self.root.join(name))?)
+    fn read(&mut self, key: &str) -> Result<Vec<u8>> {
+        Ok(fs::read(self.root.join(key))?)
     }
 }
 

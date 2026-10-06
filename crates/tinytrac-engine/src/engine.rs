@@ -1,14 +1,11 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 use jiff::{SignedDuration, Zoned, civil::Date};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use tinytrac_core::{DateRange, Session, SessionId, StartMode, Status, Tag, TagId, Timers, Totals};
 
 use crate::{
-    Error, Result, Settings,
+    Error, Result, Settings, SyncContext, SyncTarget, Transport,
     store::{self, Store},
 };
 
@@ -213,67 +210,76 @@ impl Engine {
         })
     }
 
-    /// The folder is local to this database; it is never part of synced settings.
-    pub fn sync_folder(&self) -> Result<Option<PathBuf>> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'sync_folder'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(PathBuf::from))
+    /// The target is local metadata, never part of synced settings.
+    pub fn sync_target(&self) -> Result<Option<SyncTarget>> {
+        read_target(&self.db)
     }
 
-    pub fn set_sync_folder(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        std::fs::create_dir_all(path.as_ref())?;
-        let path = std::fs::canonicalize(path)?;
-        self.check_sync_folder(&path)?;
-        let value = path
-            .to_str()
-            .ok_or_else(|| Error::Sync("sync folder must be UTF-8".into()))?;
+    /// Identity changes reset progress; changing only a remote label preserves it.
+    pub fn set_sync_target(&mut self, mut target: Option<SyncTarget>) -> Result<()> {
+        if let Some(SyncTarget::Folder(path)) = &mut target {
+            std::fs::create_dir_all(&*path)?;
+            *path = std::fs::canonicalize(&*path)?;
+            self.check_sync_folder(path)?;
+        }
+        let value = target.as_ref().map(serde_json::to_string).transpose()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'sync_folder'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if previous.as_deref() != Some(value) {
-            tx.execute("INSERT INTO meta (key, value) VALUES ('sync_folder', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [value])?;
-            tx.execute_batch("UPDATE changes SET exported = 0; DELETE FROM imported_files; UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'sync_epoch';")?;
+        let previous = read_target(&tx)?;
+        if !same_target(previous.as_ref(), target.as_ref()) {
+            if target.is_some() {
+                tx.execute_batch("UPDATE changes SET exported = 0; DELETE FROM imported_files;")?;
+            }
+            // Disabling retains diagnostics until a destination is selected again.
+            tx.execute_batch(
+                "UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'sync_epoch';",
+            )?;
+        }
+        if let Some(value) = value {
+            tx.execute("INSERT INTO meta (key, value) VALUES ('sync_target', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [value])?;
+        } else {
+            tx.execute("DELETE FROM meta WHERE key = 'sync_target'", [])?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn clear_sync_folder(&mut self) -> Result<()> {
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("DELETE FROM meta WHERE key = 'sync_folder'; UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'sync_epoch';")?;
-        tx.commit()?;
-        Ok(())
+    /// Captures the target, epoch and device in one consistent read transaction.
+    pub fn sync_context(&self) -> Result<Option<SyncContext>> {
+        self.snapshot(|engine| {
+            let epoch = crate::sync::epoch(&engine.db)?;
+            Ok(engine.sync_target()?.map(|target| SyncContext {
+                target,
+                epoch,
+                device: engine.device.clone(),
+            }))
+        })
     }
 
-    /// Publishes pending revisions before importing other devices' immutable batches.
-    pub fn sync(&mut self) -> Result<crate::SyncRun> {
-        let (root, epoch) =
-            self.snapshot(|engine| Ok((engine.sync_folder()?, crate::sync::epoch(&engine.db)?)))?;
-        let Some(root) = root else {
-            return Ok(crate::SyncRun::default());
-        };
-        let root = std::fs::canonicalize(root)?;
-        self.check_sync_folder(&root)?;
-        let folder = crate::transport::Folder {
-            root,
-            device: self.device.clone(),
-        };
-        crate::sync::run(&mut self.db, &self.device, epoch, &folder)
+    /// Runs a transport built for this context. A stale context fails before I/O.
+    /// Epoch checks also guard publication acknowledgements and import commits.
+    pub fn sync(
+        &mut self,
+        context: &SyncContext,
+        transport: &mut (impl Transport + ?Sized),
+    ) -> Result<crate::SyncRun> {
+        let current = self.sync_context()?;
+        if !current.as_ref().is_some_and(|current| {
+            current.epoch == context.epoch
+                && current.device == context.device
+                && same_target(Some(&current.target), Some(&context.target))
+        }) {
+            return Err(Error::StaleSyncContext);
+        }
+        if let SyncTarget::Folder(path) = &context.target {
+            let root = std::fs::canonicalize(path)?;
+            self.check_sync_folder(&root)?;
+            if &root != path {
+                return Err(Error::StaleSyncContext);
+            }
+        }
+        crate::sync::run(&mut self.db, &self.device, context.epoch, transport)
     }
 
     /// Durable rejections and current conflicts, even when sync is disabled.
@@ -400,6 +406,28 @@ fn require_session(store: &Store, id: SessionId) -> Result<Session> {
     store
         .get(&id.to_string())?
         .ok_or(Error::NotFound("session"))
+}
+
+fn read_target(db: &Connection) -> Result<Option<SyncTarget>> {
+    let value: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'sync_target'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| serde_json::from_str(&value).map_err(Error::from))
+        .transpose()
+}
+
+fn same_target(a: Option<&SyncTarget>, b: Option<&SyncTarget>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(SyncTarget::Folder(a)), Some(SyncTarget::Folder(b))) => a == b,
+        (Some(SyncTarget::Remote { id: a, .. }), Some(SyncTarget::Remote { id: b, .. })) => a == b,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

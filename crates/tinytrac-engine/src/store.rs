@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_sync.sql"),
     include_str!("migrations/003_sync_repairs.sql"),
+    include_str!("migrations/004_sync_targets.sql"),
 ];
 
 /// Brings the schema up to date, tracking progress in `user_version`. Refuses a

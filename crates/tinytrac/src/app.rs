@@ -38,7 +38,7 @@ pub enum Message {
     TrayMenu(String),
     TrayHost(bool),
     Refresh,
-    Synced(Result<SyncRun, String>),
+    Synced(Result<SyncRun, sync::Failure>),
     ModifiersChanged(keyboard::Modifiers),
     Show(Screen),
     DismissError,

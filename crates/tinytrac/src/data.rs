@@ -14,7 +14,7 @@ pub const HISTORY_DAYS: i64 = 14;
 pub struct Data {
     pub now: Zoned,
     pub settings: Settings,
-    pub sync_folder: String,
+    pub sync_target: Option<tinytrac_engine::SyncTarget>,
     pub sync_diagnostics: tinytrac_engine::SyncDiagnostics,
     /// All tags, archived ones included, sorted by name.
     pub tags: Vec<Tag>,
@@ -35,9 +35,7 @@ impl Data {
                 labels: tag_labels(&tags),
                 sync_diagnostics: engine.sync_diagnostics()?,
                 settings: engine.settings()?,
-                sync_folder: engine
-                    .sync_folder()?
-                    .map_or_else(String::new, |path| path.display().to_string()),
+                sync_target: engine.sync_target()?,
                 tags,
                 timers: engine.timers()?.iter().cloned().collect(),
                 recent: engine.sessions(recent_range(now.date()))?,

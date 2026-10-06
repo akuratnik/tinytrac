@@ -8,7 +8,7 @@ use iced::{
     widget::{button, column, pick_list, row, text, text_input, toggler},
 };
 use tinytrac_core::{BreakPolicy, TagId};
-use tinytrac_engine::{Engine, WeekStart};
+use tinytrac_engine::{Engine, SyncTarget, WeekStart};
 
 use crate::{
     data::Data,
@@ -44,7 +44,10 @@ impl State {
     pub fn new(data: &Data) -> Self {
         let policy = data.settings.break_policy;
         Self {
-            sync_folder: data.sync_folder.clone(),
+            sync_folder: match &data.sync_target {
+                Some(SyncTarget::Folder(path)) => path.display().to_string(),
+                _ => String::new(),
+            },
             break_minutes: policy.break_minutes.to_string(),
             work_minutes: policy.work_minutes.to_string(),
             tag_names: BTreeMap::new(),
@@ -58,11 +61,10 @@ impl State {
                 return Ok(Outcome::Edited);
             }
             Message::SaveSyncFolder => {
-                if self.sync_folder.trim().is_empty() {
-                    engine.clear_sync_folder()?;
-                } else {
-                    engine.set_sync_folder(self.sync_folder.trim())?;
-                }
+                let folder = self.sync_folder.trim();
+                engine.set_sync_target(
+                    (!folder.is_empty()).then(|| SyncTarget::Folder(folder.into())),
+                )?;
             }
             Message::BreakBank(on) => {
                 // Turning the bank on uses the ratio in the fields, saved or not.
@@ -190,12 +192,16 @@ impl State {
                     .on_press(Message::SaveSyncFolder),
             ]
             .spacing(6),
-            muted(if data.sync_folder.is_empty() {
+            muted(if data.sync_target.is_none() {
                 "Sync disabled"
             } else {
                 sync_status
             }),
         ]
+        .extend(data.sync_target.iter().filter_map(|target| match target {
+            SyncTarget::Remote { label, .. } => Some(muted(label).into()),
+            SyncTarget::Folder(_) => None,
+        }))
         .extend(diagnostics(&data.sync_diagnostics).map(|message| muted(message).into()))
         .push(heading("Tags"))
         .push(muted(

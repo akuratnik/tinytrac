@@ -6,33 +6,59 @@ use std::{
 };
 
 use iced::Task;
-use tinytrac_engine::{Engine, SyncRun};
+use tinytrac_engine::{Engine, Folder, SyncContext, SyncRun};
 
 use super::Message;
 use crate::{data::Data, screen};
 
+/// Keeps authentication failures distinct across the cloneable UI message boundary.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum Failure {
+    #[error("authentication required: {0}")]
+    AuthRequired(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<tinytrac_engine::Error> for Failure {
+    fn from(error: tinytrac_engine::Error) -> Self {
+        match error {
+            tinytrac_engine::Error::AuthRequired(message) => Self::AuthRequired(message),
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct State {
-    engine: Option<Arc<Mutex<Engine>>>,
+    engine: Option<Arc<Mutex<Worker>>>,
     pub(super) syncing: bool,
     pub(super) queued: bool,
     pub(super) problems: SyncProblems,
     pub(super) status: String,
+    last_success: Option<String>,
 }
 
 impl State {
     pub(super) fn new(engine: &Engine, data: &Data) -> screen::Result<Self> {
         // A second connection, so syncing never blocks the window's reads and writes.
-        let worker = engine
-            .path()
-            .map(Engine::open)
-            .transpose()?
-            .map(|engine| Arc::new(Mutex::new(engine)));
+        let worker = engine.path().map(Engine::open).transpose()?.map(|engine| {
+            Arc::new(Mutex::new(Worker {
+                engine,
+                transport: None,
+            }))
+        });
         let problems = SyncProblems {
             rejected: data.sync_diagnostics.rejected,
             ..Default::default()
         };
-        let status = if data.sync_folder.is_empty() {
+        let status = if data.sync_target.is_none() {
             "Sync disabled"
         } else {
             "Not synced yet"
@@ -44,6 +70,7 @@ impl State {
             queued: false,
             problems,
             status,
+            last_success: None,
         })
     }
 
@@ -57,26 +84,20 @@ impl State {
         }
         self.syncing = true;
         Task::perform(
-            async move {
-                let (sender, receiver) = iced::futures::channel::oneshot::channel();
-                std::thread::spawn(move || {
-                    let result = engine
-                        .lock()
-                        .map_err(|error| error.to_string())
-                        .and_then(|mut engine| engine.sync().map_err(|error| error.to_string()));
-                    let _ = sender.send(result);
-                });
-                receiver
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()))
-            },
+            blocking(move || {
+                engine
+                    .lock()
+                    .map_err(|error| Failure::Other(error.to_string()))?
+                    .run()
+                    .map_err(Failure::from)
+            }),
             Message::Synced,
         )
     }
 
     pub(super) fn finish(
         &mut self,
-        result: &Result<SyncRun, String>,
+        result: &Result<SyncRun, Failure>,
         data: &Data,
         now: &jiff::Zoned,
     ) -> (Option<String>, Task<Message>) {
@@ -93,21 +114,28 @@ impl State {
                     )
                 })
                 .collect::<Vec<_>>(),
-            Err(error) => vec![error.clone()],
+            Err(error) => vec![error.to_string()],
         };
         problems.sort();
         problems.dedup();
         let at = now.strftime("%H:%M:%S").to_string();
         self.status = match result {
-            _ if data.sync_folder.is_empty() => "Sync disabled".into(),
+            _ if data.sync_target.is_none() => "Sync disabled".into(),
+            Ok(_) if !problems.is_empty() => {
+                format!("Sync incomplete at {at}: {}", problems.join("; "))
+            }
             Ok(run) => format!(
                 "Synced at {at}: {} exported, {} imported",
                 run.exported, run.imported
             ),
             Err(error) => format!("Sync failed at {at}: {error}"),
         };
-        if result.is_ok() && !problems.is_empty() {
-            let _ = write!(self.status, "; {}", problems.join("; "));
+        if data.sync_target.is_some() {
+            if result.is_ok() && problems.is_empty() {
+                self.last_success = Some(at);
+            } else if let Some(at) = &self.last_success {
+                let _ = write!(self.status, "\nLast successful sync at {at}");
+            }
         }
         let rejected = data.sync_diagnostics.rejected;
         let banner = self.problems.update(rejected, problems);
@@ -150,5 +178,86 @@ impl SyncProblems {
         self.rejected = rejected;
         self.transient = transient;
         (!new.is_empty()).then(|| new.join("; "))
+    }
+}
+
+/// Retains transport caches between serialized runs, bound to one context.
+#[derive(Debug)]
+struct Worker {
+    engine: Engine,
+    transport: Option<(SyncContext, Folder)>,
+}
+
+impl Worker {
+    fn run(&mut self) -> tinytrac_engine::Result<SyncRun> {
+        let context = self.engine.sync_context()?;
+        if self.transport.as_ref().map(|(context, _)| context) != context.as_ref() {
+            self.transport = None;
+            if let Some(context) = context {
+                let transport = Folder::for_context(&context).ok_or_else(|| {
+                    tinytrac_engine::Error::Sync("remote transport is not available".into())
+                })?;
+                self.transport = Some((context, transport));
+            }
+        }
+        let Some((context, transport)) = &mut self.transport else {
+            return Ok(SyncRun::default());
+        };
+        self.engine.sync(context, transport)
+    }
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
+    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+        .await
+        .unwrap_or_else(|error| Err(Failure::Other(error.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tinytrac_engine::{SyncIssue, SyncTarget};
+
+    #[test]
+    fn incomplete_and_failed_runs_keep_the_last_clean_time() {
+        let mut engine = Engine::open_in_memory().unwrap();
+        engine
+            .set_sync_target(Some(SyncTarget::Remote {
+                id: "test".into(),
+                label: "Account".into(),
+            }))
+            .unwrap();
+        let data = Data::load(&engine).unwrap();
+        let mut state = State::new(&engine, &data).unwrap();
+        let now = "2026-10-06T12:00:00[UTC]".parse::<jiff::Zoned>().unwrap();
+        let later = "2026-10-06T12:01:00[UTC]".parse::<jiff::Zoned>().unwrap();
+        let _ = state.finish(&Ok(SyncRun::default()), &data, &now);
+        let partial = SyncRun {
+            skipped: vec![SyncIssue {
+                file: None,
+                reason: "offline".into(),
+            }],
+            ..SyncRun::default()
+        };
+        let _ = state.finish(&Ok(partial), &data, &later);
+        assert_eq!(
+            state.status,
+            "Sync incomplete at 12:01:00: sync: offline\nLast successful sync at 12:00:00"
+        );
+        let failure = Failure::from(tinytrac_engine::Error::AuthRequired("sign in".into()));
+        assert!(matches!(failure, Failure::AuthRequired(_)));
+        let _ = state.finish(&Err(failure), &data, &later);
+        assert_eq!(
+            state.status,
+            "Sync failed at 12:01:00: authentication required: sign in\nLast successful sync at 12:00:00"
+        );
+        let _ = state.finish(&Ok(SyncRun::default()), &data, &later);
+        assert_eq!(state.status, "Synced at 12:01:00: 0 exported, 0 imported");
     }
 }

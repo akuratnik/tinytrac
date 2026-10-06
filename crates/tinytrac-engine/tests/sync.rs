@@ -31,7 +31,9 @@ impl Pair {
         for engine in [&mut a, &mut b] {
             let clock = clock.clone();
             engine.set_clock(move || clock.lock().unwrap().clone());
-            engine.set_sync_folder(&folder).unwrap();
+            engine
+                .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&folder).into())))
+                .unwrap();
         }
         Self {
             a,
@@ -44,8 +46,8 @@ impl Pair {
 
     fn exchange(&mut self) {
         for _ in 0..2 {
-            self.a.sync().unwrap();
-            self.b.sync().unwrap();
+            folder_sync(&mut self.a).unwrap();
+            folder_sync(&mut self.b).unwrap();
         }
     }
 
@@ -125,8 +127,8 @@ fn records_edits_tombstones_and_settings_propagate_idempotently() {
             pair.count("b", "imported_files")
         ]
     );
-    assert_eq!(pair.a.sync().unwrap().exported, 0);
-    assert_eq!(pair.b.sync().unwrap().imported, 0);
+    assert_eq!(folder_sync(&mut pair.a).unwrap().exported, 0);
+    assert_eq!(folder_sync(&mut pair.b).unwrap().imported, 0);
 }
 
 #[test]
@@ -141,14 +143,14 @@ fn concurrent_heads_converge_and_conflicts_are_not_duplicated() {
     assert_eq!(pair.b.tags().unwrap()[0].name(), "Laptop");
     assert_eq!(
         {
-            pair.a.sync().unwrap();
+            folder_sync(&mut pair.a).unwrap();
             pair.a.sync_diagnostics().unwrap().conflicts
         },
         1
     );
     assert_eq!(
         {
-            pair.b.sync().unwrap();
+            folder_sync(&mut pair.b).unwrap();
             pair.b.sync_diagnostics().unwrap().conflicts
         },
         1
@@ -159,14 +161,14 @@ fn concurrent_heads_converge_and_conflicts_are_not_duplicated() {
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
     assert_eq!(
         {
-            pair.a.sync().unwrap();
+            folder_sync(&mut pair.a).unwrap();
             pair.a.sync_diagnostics().unwrap().conflicts
         },
         0
     );
     assert_eq!(
         {
-            pair.b.sync().unwrap();
+            folder_sync(&mut pair.b).unwrap();
             pair.b.sync_diagnostics().unwrap().conflicts
         },
         0
@@ -177,19 +179,19 @@ fn concurrent_heads_converge_and_conflicts_are_not_duplicated() {
 fn late_ancestors_do_not_replace_their_descendants() {
     let mut pair = Pair::new();
     let tag = pair.a.create_tag("Initial").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let old = pair.files()[0].clone();
     let bytes = fs::read(&old).unwrap();
     fs::remove_file(&old).unwrap();
     pair.a.rename_tag(tag.id, "New").unwrap();
-    pair.a.sync().unwrap();
-    assert_eq!(pair.b.sync().unwrap().imported, 1);
+    folder_sync(&mut pair.a).unwrap();
+    assert_eq!(folder_sync(&mut pair.b).unwrap().imported, 1);
     fs::write(&old, bytes).unwrap();
-    assert_eq!(pair.b.sync().unwrap().imported, 1);
+    assert_eq!(folder_sync(&mut pair.b).unwrap().imported, 1);
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
     assert_eq!(
         {
-            pair.b.sync().unwrap();
+            folder_sync(&mut pair.b).unwrap();
             pair.b.sync_diagnostics().unwrap().conflicts
         },
         0
@@ -200,7 +202,7 @@ fn late_ancestors_do_not_replace_their_descendants() {
 fn corrupt_files_and_invalid_changes_are_reported_once() {
     let mut pair = Pair::new();
     pair.a.create_tag("Valid").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let path = pair.files()[0].clone();
     let good = fs::read(&path).unwrap();
     let corrupt = path.with_file_name("corrupt.json");
@@ -211,11 +213,11 @@ fn corrupt_files_and_invalid_changes_are_reported_once() {
     let invalid = path.with_file_name("invalid.json");
     fs::write(&invalid, serde_json::to_vec(&batch).unwrap()).unwrap();
     fs::write(path.with_file_name("ignored.tmp"), b"not JSON").unwrap();
-    let report = pair.b.sync().unwrap();
+    let report = folder_sync(&mut pair.b).unwrap();
     assert_eq!(report.imported, 1);
     let diagnostics = pair.b.sync_diagnostics().unwrap();
     assert_eq!(diagnostics.rejected, 2);
-    let later = pair.b.sync().unwrap();
+    let later = folder_sync(&mut pair.b).unwrap();
     assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 2);
     assert_eq!(
         pair.b.sync_diagnostics().unwrap().reason,
@@ -224,7 +226,7 @@ fn corrupt_files_and_invalid_changes_are_reported_once() {
     assert!(later.skipped.is_empty());
     fs::write(&corrupt, &good).unwrap();
     fs::write(&invalid, &good).unwrap();
-    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    assert!(folder_sync(&mut pair.b).unwrap().skipped.is_empty());
     assert_eq!(pair.count("b", "changes"), 1);
     assert_eq!(pair.count("b", "imported_files"), 3);
 }
@@ -259,14 +261,14 @@ fn timers_can_move_between_devices_and_offline_duplicates_are_settled() {
     ));
     assert_eq!(
         {
-            pair.a.sync().unwrap();
+            folder_sync(&mut pair.a).unwrap();
             pair.a.sync_diagnostics().unwrap().conflicts
         },
         0
     );
     assert_eq!(
         {
-            pair.b.sync().unwrap();
+            folder_sync(&mut pair.b).unwrap();
             pair.b.sync_diagnostics().unwrap().conflicts
         },
         0
@@ -287,18 +289,34 @@ fn timers_can_move_between_devices_and_offline_duplicates_are_settled() {
 #[test]
 fn configuration_is_local_persistent_and_excludes_the_database() {
     let mut pair = Pair::new();
-    assert!(pair.a.set_sync_folder(pair.root.path()).is_err());
-    assert_eq!(pair.a.sync_folder().unwrap(), Some(pair.folder.clone()));
+    assert!(
+        pair.a
+            .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder(
+                pair.root.path().into()
+            )))
+            .is_err()
+    );
+    assert_eq!(
+        pair.a.sync_target().unwrap(),
+        Some(tinytrac_engine::SyncTarget::Folder(pair.folder.clone()))
+    );
     let reopened = Engine::open(pair.root.path().join("a.db")).unwrap();
-    assert_eq!(reopened.sync_folder().unwrap(), Some(pair.folder.clone()));
-    pair.a.clear_sync_folder().unwrap();
-    assert!(pair.a.sync_folder().unwrap().is_none());
-    assert!(pair.b.sync_folder().unwrap().is_some());
+    assert_eq!(
+        reopened.sync_target().unwrap(),
+        Some(tinytrac_engine::SyncTarget::Folder(pair.folder.clone()))
+    );
+    pair.a.set_sync_target(None).unwrap();
+    assert!(pair.a.sync_target().unwrap().is_none());
+    assert!(pair.b.sync_target().unwrap().is_some());
     #[cfg(unix)]
     {
         let alias = pair.root.path().join("alias");
         std::os::unix::fs::symlink(pair.root.path(), &alias).unwrap();
-        assert!(pair.a.set_sync_folder(alias).is_err());
+        assert!(
+            pair.a
+                .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder(alias)))
+                .is_err()
+        );
     }
 }
 
@@ -315,8 +333,8 @@ fn publication_failures_never_mark_unsent_changes_and_retries_are_safe() {
     let directory = pair.folder.join(device);
     fs::write(&directory, b"blocks directory creation").unwrap();
     pair.b.create_tag("Remote").unwrap();
-    pair.b.sync().unwrap();
-    let report = pair.a.sync().unwrap();
+    folder_sync(&mut pair.b).unwrap();
+    let report = folder_sync(&mut pair.a).unwrap();
     assert_eq!(report.skipped.len(), 1);
     assert_eq!(report.imported, 1, "export failure must not block import");
     let pending = || {
@@ -331,7 +349,7 @@ fn publication_failures_never_mark_unsent_changes_and_retries_are_safe() {
     assert_eq!(pending(), 1);
     fs::remove_file(&directory).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_export BEFORE UPDATE OF exported ON changes BEGIN SELECT RAISE(ABORT, 'simulated commit failure'); END;").unwrap();
-    assert_eq!(pair.a.sync().unwrap().skipped.len(), 1);
+    assert_eq!(folder_sync(&mut pair.a).unwrap().skipped.len(), 1);
     assert_eq!(
         pair.files().len(),
         2,
@@ -342,10 +360,10 @@ fn publication_failures_never_mark_unsent_changes_and_retries_are_safe() {
     connection
         .execute_batch("DROP TRIGGER fail_export")
         .unwrap();
-    assert_eq!(pair.a.sync().unwrap().exported, 1);
+    assert_eq!(folder_sync(&mut pair.a).unwrap().exported, 1);
     assert_eq!(fs::read(&pair.files()[0]).unwrap(), original);
     assert_eq!(pending(), 0);
-    assert_eq!(pair.b.sync().unwrap().imported, 1);
+    assert_eq!(folder_sync(&mut pair.b).unwrap().imported, 1);
     pair.a.create_tag("Second").unwrap();
     pair.exchange();
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
@@ -377,12 +395,12 @@ fn invalid_ids_kinds_and_bodies_do_not_prevent_valid_siblings() {
     let batch =
         serde_json::json!({"version": 1, "changes": [mismatch, changed_kind, unknown, valid]});
     fs::write(path, serde_json::to_vec(&batch).unwrap()).unwrap();
-    let report = pair.b.sync().unwrap();
+    let report = folder_sync(&mut pair.b).unwrap();
     assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 3);
     assert_eq!(report.imported, 1);
     assert_eq!(pair.b.tags().unwrap()[0].name(), "Accepted sibling");
-    assert_eq!(pair.b.sync().unwrap().imported, 0);
-    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    assert_eq!(folder_sync(&mut pair.b).unwrap().imported, 0);
+    assert!(folder_sync(&mut pair.b).unwrap().skipped.is_empty());
     assert_eq!(pair.count("b", "changes"), 2);
 }
 
@@ -390,14 +408,14 @@ fn invalid_ids_kinds_and_bodies_do_not_prevent_valid_siblings() {
 fn truncated_files_are_retried_until_complete() {
     let mut pair = Pair::new();
     pair.a.create_tag("Arriving").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let path = pair.files()[0].clone();
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
-    assert_eq!(pair.b.sync().unwrap().skipped.len(), 1);
+    assert_eq!(folder_sync(&mut pair.b).unwrap().skipped.len(), 1);
     fs::write(path, bytes).unwrap();
-    assert_eq!(pair.b.sync().unwrap().imported, 1);
-    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    assert_eq!(folder_sync(&mut pair.b).unwrap().imported, 1);
+    assert!(folder_sync(&mut pair.b).unwrap().skipped.is_empty());
 }
 
 #[test]
@@ -408,26 +426,28 @@ fn restored_backup_can_publish_reused_sequences() {
     let backup = root.path().join("backup.db");
     let mut a = Engine::open(&path).unwrap();
     let mut b = Engine::open(root.path().join("b.db")).unwrap();
-    a.set_sync_folder(&folder).unwrap();
-    b.set_sync_folder(&folder).unwrap();
+    a.set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&folder).into())))
+        .unwrap();
+    b.set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&folder).into())))
+        .unwrap();
     Connection::open(&path)
         .unwrap()
         .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
         .unwrap();
     a.create_tag("Before restore").unwrap();
-    assert_eq!(a.sync().unwrap().exported, 1);
-    b.sync().unwrap();
+    assert_eq!(folder_sync(&mut a).unwrap().exported, 1);
+    folder_sync(&mut b).unwrap();
     drop(a);
     fs::copy(backup, &path).unwrap();
     let mut a = Engine::open(&path).unwrap();
     a.create_tag("After restore").unwrap();
     b.create_tag("Remote").unwrap();
-    b.sync().unwrap();
-    let report = a.sync().unwrap();
+    folder_sync(&mut b).unwrap();
+    let report = folder_sync(&mut a).unwrap();
     assert_eq!(report.exported, 1);
     assert_eq!(report.imported, 1);
     assert!(report.skipped.is_empty());
-    assert_eq!(b.sync().unwrap().imported, 1);
+    assert_eq!(folder_sync(&mut b).unwrap().imported, 1);
     assert_eq!(b.tags().unwrap().len(), 3);
 }
 
@@ -443,13 +463,15 @@ fn randomized_three_device_exchange_converges() {
             .iter()
             .map(|path| {
                 let mut engine = Engine::open(path).unwrap();
-                engine.set_sync_folder(&folder).unwrap();
+                engine
+                    .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&folder).into())))
+                    .unwrap();
                 engine
             })
             .collect();
         let tag = engines[0].create_tag("Shared").unwrap().id;
         for engine in &mut engines {
-            engine.sync().unwrap();
+            folder_sync(engine).unwrap();
         }
         let mut state = seed;
         let mut random = || {
@@ -487,13 +509,13 @@ fn randomized_three_device_exchange_converges() {
                     }
                 }
                 _ => {
-                    engine.sync().unwrap();
+                    folder_sync(engine).unwrap();
                 }
             }
         }
         for _ in 0..3 {
             for engine in &mut engines {
-                assert!(engine.sync().unwrap().skipped.is_empty());
+                assert!(folder_sync(engine).unwrap().skipped.is_empty());
             }
         }
         let snapshot = |path: &PathBuf, sql: &str| {
@@ -537,7 +559,7 @@ fn randomized_three_device_exchange_converges() {
 fn a_headless_graph_rejects_its_whole_file_but_valid_files_import() {
     let mut pair = Pair::new();
     pair.a.create_tag("Template").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let path = pair.files()[0].clone();
     let mut batch: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let mut first = batch["changes"][0].clone();
@@ -561,11 +583,11 @@ fn a_headless_graph_rejects_its_whole_file_but_valid_files_import() {
     let valid = batch["changes"][0].clone();
     batch["changes"] = serde_json::json!([first, second, valid]);
     fs::write(&path, serde_json::to_vec(&batch).unwrap()).unwrap();
-    let report = pair.b.sync().unwrap();
+    let report = folder_sync(&mut pair.b).unwrap();
     assert_eq!(report.imported, 1);
     assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 1);
     assert_eq!(pair.count("b", "changes"), 1);
-    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    assert!(folder_sync(&mut pair.b).unwrap().skipped.is_empty());
 }
 
 #[test]
@@ -578,9 +600,9 @@ fn import_two_thousand_pause_resume_cycles() {
         pair.a.pause(tag).unwrap();
         pair.a.start(tag, StartMode::Exclusive).unwrap();
     }
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let start = std::time::Instant::now();
-    let report = pair.b.sync().unwrap();
+    let report = folder_sync(&mut pair.b).unwrap();
     let elapsed = start.elapsed();
     eprintln!(
         "2000 pause/resume cycles: {elapsed:?} ({} revisions)",
@@ -606,32 +628,41 @@ fn switching_folders_republishes_foreign_revisions_and_tombstones() {
     pair.exchange();
     pair.b.delete_session(entry.id).unwrap();
     pair.exchange();
-    pair.a.set_sync_folder(&pair.folder).unwrap();
-    assert_eq!(pair.a.sync().unwrap().exported, 0);
+    pair.a
+        .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder(
+            (&pair.folder).into(),
+        )))
+        .unwrap();
+    assert_eq!(folder_sync(&mut pair.a).unwrap().exported, 0);
     let fresh = pair.root.path().join("fresh");
-    pair.a.set_sync_folder(&fresh).unwrap();
+    pair.a
+        .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&fresh).into())))
+        .unwrap();
     let expected = usize::try_from(pair.count("a", "changes")).unwrap();
-    assert_eq!(pair.a.sync().unwrap().exported, expected);
+    assert_eq!(folder_sync(&mut pair.a).unwrap().exported, expected);
     let mut peer = Engine::open(pair.root.path().join("fresh.db")).unwrap();
-    peer.set_sync_folder(&fresh).unwrap();
-    assert_eq!(peer.sync().unwrap().imported, expected);
+    peer.set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&fresh).into())))
+        .unwrap();
+    assert_eq!(folder_sync(&mut peer).unwrap().imported, expected);
     assert_eq!(peer.tags().unwrap(), pair.a.tags().unwrap());
     assert!(peer.sessions(today()).unwrap().is_empty());
-    pair.a.clear_sync_folder().unwrap();
-    pair.a.set_sync_folder(&fresh).unwrap();
-    assert_eq!(pair.a.sync().unwrap().exported, expected);
-    assert_eq!(peer.sync().unwrap().imported, 0);
+    pair.a.set_sync_target(None).unwrap();
+    pair.a
+        .set_sync_target(Some(tinytrac_engine::SyncTarget::Folder((&fresh).into())))
+        .unwrap();
+    assert_eq!(folder_sync(&mut pair.a).unwrap().exported, expected);
+    assert_eq!(folder_sync(&mut peer).unwrap().imported, 0);
 }
 
 #[test]
 fn newer_versions_remain_retryable_and_do_not_block_other_files() {
     let mut pair = Pair::new();
     pair.a.create_tag("Readable").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let file = pair.files()[0].with_file_name("future.json");
     fs::write(&file, br#"{"version":2,"changes":{"new-format":true}}"#).unwrap();
     for expected in [1, 0] {
-        let report = pair.b.sync().unwrap();
+        let report = folder_sync(&mut pair.b).unwrap();
         assert_eq!(report.imported, expected);
         assert_eq!(pair.b.sync_diagnostics().unwrap().rejected, 0);
         assert_eq!(report.skipped.len(), 1);
@@ -639,7 +670,7 @@ fn newer_versions_remain_retryable_and_do_not_block_other_files() {
         assert_eq!(pair.count("b", "imported_files"), 1);
     }
     fs::write(file, br#"{"version":1,"changes":[]}"#).unwrap();
-    assert!(pair.b.sync().unwrap().skipped.is_empty());
+    assert!(folder_sync(&mut pair.b).unwrap().skipped.is_empty());
     assert_eq!(pair.count("b", "imported_files"), 2);
 }
 
@@ -647,15 +678,15 @@ fn newer_versions_remain_retryable_and_do_not_block_other_files() {
 fn rejections_remain_visible_after_reopen_and_when_sync_is_disabled() {
     let mut pair = Pair::new();
     pair.a.create_tag("Valid").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     fs::write(pair.files()[0].with_file_name("bad.json"), b"invalid JSON").unwrap();
-    pair.b.sync().unwrap();
+    folder_sync(&mut pair.b).unwrap();
     let first = pair.b.sync_diagnostics().unwrap();
     assert_eq!(first.rejected, 1);
     assert!(first.reason.is_some());
     let mut reopened = Engine::open(pair.root.path().join("b.db")).unwrap();
-    reopened.clear_sync_folder().unwrap();
-    assert!(reopened.sync().unwrap().skipped.is_empty());
+    reopened.set_sync_target(None).unwrap();
+    assert!(folder_sync(&mut reopened).unwrap().skipped.is_empty());
     let later = reopened.sync_diagnostics().unwrap();
     assert_eq!(later.rejected, first.rejected);
     assert_eq!(later.reason, first.reason);
@@ -667,8 +698,11 @@ fn partial_three_device_repairs_converge_without_further_revisions() {
     let tag = pair.a.create_tag("Offline").unwrap().id;
     pair.exchange();
     let mut c = Engine::open(pair.root.path().join("c.db")).unwrap();
-    c.set_sync_folder(&pair.folder).unwrap();
-    c.sync().unwrap();
+    c.set_sync_target(Some(tinytrac_engine::SyncTarget::Folder(
+        (&pair.folder).into(),
+    )))
+    .unwrap();
+    folder_sync(&mut c).unwrap();
     for (engine, time) in [
         (&mut pair.a, "09:00"),
         (&mut pair.b, "09:05"),
@@ -683,11 +717,11 @@ fn partial_three_device_repairs_converge_without_further_revisions() {
     for (engine, day) in [(&mut pair.a, "02"), (&mut pair.b, "03"), (&mut c, "04")] {
         let now: Zoned = format!("2026-10-{day}T12:00[UTC]").parse().unwrap();
         engine.set_clock(move || now.clone());
-        engine.sync().unwrap();
+        folder_sync(engine).unwrap();
     }
     for _ in 0..4 {
         pair.exchange();
-        c.sync().unwrap();
+        folder_sync(&mut c).unwrap();
     }
     let records = |device: &str| {
         let db = Connection::open(pair.root.path().join(format!("{device}.db"))).unwrap();
@@ -723,7 +757,7 @@ fn partial_three_device_repairs_converge_without_further_revisions() {
         pair.count("c", "changes"),
     ];
     for engine in [&mut pair.a, &mut pair.b, &mut c] {
-        let report = engine.sync().unwrap();
+        let report = folder_sync(engine).unwrap();
         assert_eq!((report.imported, report.exported), (0, 0));
     }
     assert_eq!(
@@ -740,7 +774,7 @@ fn partial_three_device_repairs_converge_without_further_revisions() {
 fn kind_validation_uses_unmaterialized_history() {
     let mut pair = Pair::new();
     pair.a.create_tag("New record").unwrap();
-    pair.a.sync().unwrap();
+    folder_sync(&mut pair.a).unwrap();
     let file = pair.files()[0].clone();
     let mut batch: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
     let mut wrong_kind = batch["changes"][0].clone();
@@ -749,7 +783,7 @@ fn kind_validation_uses_unmaterialized_history() {
     wrong_kind["body"] = serde_json::Value::Null;
     batch["changes"].as_array_mut().unwrap().push(wrong_kind);
     fs::write(file, serde_json::to_vec(&batch).unwrap()).unwrap();
-    let report = pair.b.sync().unwrap();
+    let report = folder_sync(&mut pair.b).unwrap();
     assert_eq!(
         (report.imported, pair.b.sync_diagnostics().unwrap().rejected),
         (1, 1)
@@ -776,7 +810,7 @@ fn identical_heads_are_hidden_in_counts_but_merged_by_the_next_write() {
     for engine in [&mut pair.a, &mut pair.b] {
         assert_eq!(
             {
-                engine.sync().unwrap();
+                folder_sync(engine).unwrap();
                 engine.sync_diagnostics().unwrap().conflicts
             },
             0
@@ -789,4 +823,12 @@ fn identical_heads_are_hidden_in_counts_but_merged_by_the_next_write() {
     assert_eq!(pair.count("a", "conflicts"), 0);
     assert_eq!(pair.count("b", "conflicts"), 0);
     assert_eq!(pair.a.tags().unwrap(), pair.b.tags().unwrap());
+}
+
+fn folder_sync(engine: &mut Engine) -> tinytrac_engine::Result<tinytrac_engine::SyncRun> {
+    let Some(context) = engine.sync_context()? else {
+        return Ok(tinytrac_engine::SyncRun::default());
+    };
+    let mut transport = tinytrac_engine::Folder::for_context(&context).unwrap();
+    engine.sync(&context, &mut transport)
 }

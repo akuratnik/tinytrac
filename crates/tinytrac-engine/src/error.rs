@@ -4,6 +4,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("authentication required: {0}")]
+    AuthRequired(String),
+    #[error("sync context is stale")]
+    StaleSyncContext,
     #[error("file I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid sync data: {0}")]

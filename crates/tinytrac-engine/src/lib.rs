@@ -17,4 +17,5 @@ pub use settings::{Settings, WeekStart};
 
 mod sync;
 mod transport;
-pub use sync::{SyncDiagnostics, SyncIssue, SyncRun};
+pub use sync::{SyncContext, SyncDiagnostics, SyncIssue, SyncRun, SyncTarget};
+pub use transport::{Folder, Transport};

@@ -18,6 +18,33 @@ use crate::{
     transport::Transport,
 };
 
+/// Local destination identity. Remote labels are display-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncTarget {
+    Folder(std::path::PathBuf),
+    Remote { id: String, label: String },
+}
+
+/// An immutable transport binding obtained from [`crate::Engine::sync_context`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncContext {
+    pub(crate) target: SyncTarget,
+    pub(crate) epoch: i64,
+    pub(crate) device: String,
+}
+
+impl SyncContext {
+    pub fn target(&self) -> &SyncTarget {
+        &self.target
+    }
+    pub fn epoch(&self) -> i64 {
+        self.epoch
+    }
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncRun {
     pub exported: usize,
@@ -72,11 +99,12 @@ pub(crate) fn run(
     db: &mut Connection,
     device: &str,
     selected_epoch: i64,
-    transport: &impl Transport,
+    transport: &mut (impl Transport + ?Sized),
 ) -> Result<SyncRun> {
     let mut report = SyncRun::default();
     match export(db, selected_epoch, transport) {
         Ok(count) => report.exported = count,
+        Err(error @ Error::AuthRequired(_)) => return Err(error),
         Err(error) => report.skipped.push(SyncIssue {
             file: None,
             reason: format!("export: {error}"),
@@ -91,6 +119,9 @@ pub(crate) fn run(
                 if let Err(error) =
                     import_file(db, device, selected_epoch, transport, &name, &mut report)
                 {
+                    if matches!(error, Error::AuthRequired(_)) {
+                        return Err(error);
+                    }
                     report.skipped.push(SyncIssue {
                         file: Some(name),
                         reason: error.to_string(),
@@ -98,6 +129,7 @@ pub(crate) fn run(
                 }
             }
         }
+        Err(error @ Error::AuthRequired(_)) => return Err(error),
         Err(error) => report.skipped.push(SyncIssue {
             file: None,
             reason: format!("list: {error}"),
@@ -122,7 +154,11 @@ pub(crate) fn epoch(db: &Connection) -> Result<i64> {
     )?)
 }
 
-fn export(db: &mut Connection, selected_epoch: i64, transport: &impl Transport) -> Result<usize> {
+fn export(
+    db: &mut Connection,
+    selected_epoch: i64,
+    transport: &mut (impl Transport + ?Sized),
+) -> Result<usize> {
     let mut exported = 0;
     loop {
         let tx = db.transaction()?;
@@ -188,7 +224,7 @@ fn import_file(
     db: &mut Connection,
     device: &str,
     selected_epoch: i64,
-    transport: &impl Transport,
+    transport: &mut (impl Transport + ?Sized),
     name: &str,
     report: &mut SyncRun,
 ) -> Result<()> {
@@ -328,14 +364,14 @@ mod tests {
     struct Publisher<F>(F);
 
     impl<F: Fn(&[u8])> Transport for Publisher<F> {
-        fn publish(&self, _: &str, bytes: &[u8]) -> Result<()> {
+        fn publish(&mut self, _: &str, bytes: &[u8]) -> Result<()> {
             self.0(bytes);
             Ok(())
         }
-        fn list(&self) -> Result<Vec<String>> {
+        fn list(&mut self) -> Result<Vec<String>> {
             Ok(Vec::new())
         }
-        fn read(&self, _: &str) -> Result<Vec<u8>> {
+        fn read(&mut self, _: &str) -> Result<Vec<u8>> {
             unreachable!()
         }
     }
@@ -348,18 +384,18 @@ mod tests {
             during_list: bool,
         }
         impl Transport for Switching<'_> {
-            fn publish(&self, _: &str, _: &[u8]) -> Result<()> {
+            fn publish(&mut self, _: &str, _: &[u8]) -> Result<()> {
                 Ok(())
             }
-            fn list(&self) -> Result<Vec<String>> {
+            fn list(&mut self) -> Result<Vec<String>> {
                 if self.during_list {
-                    self.engine.borrow_mut().clear_sync_folder()?;
+                    self.engine.borrow_mut().set_sync_target(None)?;
                 }
                 Ok(vec!["first.json".into(), "second.json".into()])
             }
-            fn read(&self, _: &str) -> Result<Vec<u8>> {
+            fn read(&mut self, _: &str) -> Result<Vec<u8>> {
                 *self.reads.borrow_mut() += 1;
-                self.engine.borrow_mut().clear_sync_folder()?;
+                self.engine.borrow_mut().set_sync_target(None)?;
                 // Parsing this would produce a retryable unsupported-version issue.
                 Ok(br#"{"version":2}"#.to_vec())
             }
@@ -369,13 +405,19 @@ mod tests {
         let mut engine = Engine::open(&path).unwrap();
         let mut db = Connection::open(&path).unwrap();
         for during_list in [true, false] {
+            engine
+                .set_sync_target(Some(SyncTarget::Remote {
+                    id: "test".into(),
+                    label: "Test".into(),
+                }))
+                .unwrap();
             let selected = epoch(&db).unwrap();
-            let transport = Switching {
+            let mut transport = Switching {
                 engine: RefCell::new(&mut engine),
                 reads: RefCell::new(0),
                 during_list,
             };
-            let run = run(&mut db, "test", selected, &transport).unwrap();
+            let run = run(&mut db, "test", selected, &mut transport).unwrap();
             assert!(run.skipped.is_empty());
             assert_eq!(*transport.reads.borrow(), usize::from(!during_list));
             assert_eq!(run.imported, 0);
@@ -388,7 +430,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("db");
         let mut engine = Engine::open(&path).unwrap();
-        engine.set_sync_folder(root.path().join("old")).unwrap();
+        engine
+            .set_sync_target(Some(SyncTarget::Folder(root.path().join("old"))))
+            .unwrap();
         let mut db = Connection::open(&path).unwrap();
         let tx = db.transaction().unwrap();
         let store = Store::new(&tx, "test-device");
@@ -399,13 +443,15 @@ mod tests {
         }
         tx.commit().unwrap();
         let selected = epoch(&db).unwrap();
-        let switch = Publisher(|_: &[u8]| {
+        let mut switch = Publisher(|_: &[u8]| {
             // A second writer can commit while publication is in progress.
             let mut other = Engine::open(&path).unwrap();
             other.create_tag("During publication").unwrap();
-            other.set_sync_folder(root.path().join("new")).unwrap();
+            other
+                .set_sync_target(Some(SyncTarget::Folder(root.path().join("new"))))
+                .unwrap();
         });
-        assert_eq!(export(&mut db, selected, &switch).unwrap(), 0);
+        assert_eq!(export(&mut db, selected, &mut switch).unwrap(), 0);
         let pending: i64 = db
             .query_row(
                 "SELECT count(*) FROM changes WHERE exported = 0",
@@ -415,13 +461,13 @@ mod tests {
             .unwrap();
         assert_eq!(pending, 1002);
         let sizes = RefCell::new(Vec::new());
-        let publisher = Publisher(|bytes: &[u8]| {
+        let mut publisher = Publisher(|bytes: &[u8]| {
             let batch: Batch<Vec<&RawValue>> = serde_json::from_slice(bytes).unwrap();
             sizes.borrow_mut().push(batch.changes.len());
         });
-        assert_eq!(export(&mut db, selected, &publisher).unwrap(), 0);
+        assert_eq!(export(&mut db, selected, &mut publisher).unwrap(), 0);
         let selected = epoch(&db).unwrap();
-        assert_eq!(export(&mut db, selected, &publisher).unwrap(), 1002);
+        assert_eq!(export(&mut db, selected, &mut publisher).unwrap(), 1002);
         assert_eq!(*sizes.borrow(), [1000, 2]);
     }
 }
