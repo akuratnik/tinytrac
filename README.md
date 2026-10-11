@@ -110,3 +110,7 @@ all known conflicting versions and clears the notice after syncing. Keep the sha
 do not delete its batches.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how it fits together.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
