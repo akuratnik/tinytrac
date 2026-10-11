@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: scripts/bundle-macos.sh [--universal] [--sign "identity"] [--zip]'
+    echo 'Usage: scripts/bundle-macos.sh [--universal] [--sign "identity"] [--zip] [--dmg]'
 }
 
 die() {
@@ -12,11 +12,13 @@ die() {
 
 universal=false
 zip=false
+dmg=false
 identity=-
 while (($#)); do
     case "$1" in
         --universal) universal=true ;;
         --zip) zip=true ;;
+        --dmg) dmg=true ;;
         --sign)
             (($# >= 2)) && [[ -n "$2" ]] || die '--sign needs a signing identity.'
             identity=$2
@@ -34,6 +36,10 @@ for tool in cargo rustc plutil sips iconutil codesign ditto; do
     command -v "$tool" >/dev/null || die "Required tool not found: $tool"
 done
 
+if $dmg; then
+    command -v hdiutil >/dev/null || die 'Required tool not found: hdiutil'
+fi
+
 export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-13.0}
 [[ $MACOSX_DEPLOYMENT_TARGET =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
     die 'MACOSX_DEPLOYMENT_TARGET must be a version such as 13.0.'
@@ -45,17 +51,22 @@ version=$(awk '
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Expected a numeric workspace version in Cargo.toml.'
 
 client=${TINYTRAC_GOOGLE_CLIENT:-$HOME/.config/tinytrac/google-client.json}
-# Clear inherited credentials so a missing file really disables Google sync.
-unset TINYTRAC_GOOGLE_CLIENT_ID TINYTRAC_GOOGLE_CLIENT_SECRET
-if [[ -f "$client" ]]; then
+# An explicit environment pair wins over the local JSON file. Reject partial pairs.
+if [[ -n ${TINYTRAC_GOOGLE_CLIENT_ID:-} || -n ${TINYTRAC_GOOGLE_CLIENT_SECRET:-} ]]; then
+    [[ -n ${TINYTRAC_GOOGLE_CLIENT_ID:-} && -n ${TINYTRAC_GOOGLE_CLIENT_SECRET:-} ]] ||
+        die 'Set both Google client environment variables, or neither.'
+    export TINYTRAC_GOOGLE_CLIENT_ID TINYTRAC_GOOGLE_CLIENT_SECRET
+    echo 'Building with Google sync credentials from the environment.'
+elif [[ -f "$client" ]]; then
     TINYTRAC_GOOGLE_CLIENT_ID=$(plutil -extract installed.client_id raw -o - "$client")
     TINYTRAC_GOOGLE_CLIENT_SECRET=$(plutil -extract installed.client_secret raw -o - "$client")
     [[ -n "$TINYTRAC_GOOGLE_CLIENT_ID" && -n "$TINYTRAC_GOOGLE_CLIENT_SECRET" ]] ||
         die 'Google client ID and secret must both be nonempty.'
     export TINYTRAC_GOOGLE_CLIENT_ID TINYTRAC_GOOGLE_CLIENT_SECRET
-    echo "Building with Google sync credentials from $client"
+    echo 'Building with Google sync credentials from JSON.'
 else
-    echo "No Google credentials at $client; building without Google sync."
+    unset TINYTRAC_GOOGLE_CLIENT_ID TINYTRAC_GOOGLE_CLIENT_SECRET
+    echo 'No Google credentials; building without Google sync.'
 fi
 
 host=$(rustc -vV | sed -n 's/^host: //p')
@@ -122,6 +133,8 @@ cat > "$app/Contents/Info.plist" <<EOF
 EOF
 plutil -lint "$app/Contents/Info.plist"
 codesign --force --sign "$identity" "$app"
+# Verify integrity and the designated requirement, without a trust/Gatekeeper policy.
+# A self-signed identity is valid here; do not add an "anchor trusted" requirement.
 codesign --verify --deep --strict --verbose=2 "$app"
 echo 'Code signature verification passed.'
 
@@ -132,6 +145,16 @@ echo "Created $destination"
 if $zip; then
     archive="$PWD/target/bundle/tinytrac-$version-macos.zip"
     ditto -c -k --keepParent "$destination" "$archive"
+    echo "Created $archive"
+fi
+
+if $dmg; then
+    image_root="$stage/dmg"
+    mkdir -p "$image_root"
+    ditto "$destination" "$image_root/tinytrac.app"
+    ln -s /Applications "$image_root/Applications"
+    archive="$PWD/target/bundle/tinytrac-$version-macos.dmg"
+    hdiutil create -ov -format UDZO -volname tinytrac -srcfolder "$image_root" "$archive"
     echo "Created $archive"
 fi
 

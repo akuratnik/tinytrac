@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: version
+        name: Check workspace version and tag
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          with open('Cargo.toml', 'rb') as file:
+              version = tomllib.load(file)['workspace']['package']['version']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+              raise SystemExit('::error::Expected a numeric X.Y.Z workspace version.')
+          if os.environ['GITHUB_REF_TYPE'] == 'tag' and os.environ['GITHUB_REF_NAME'] != f'v{version}':
+              raise SystemExit(f'::error::Tag must match Cargo.toml workspace version: v{version}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as file:
+              file.write(f'version={version}\n')
+          PY
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos
+          - os: ubuntu-24.04
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TINYTRAC_GOOGLE_CLIENT_ID: ${{ secrets.TINYTRAC_GOOGLE_CLIENT_ID }}
+      TINYTRAC_GOOGLE_CLIENT_SECRET: ${{ secrets.TINYTRAC_GOOGLE_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Check Google credentials
+        run: |
+          if [[ -z ${TINYTRAC_GOOGLE_CLIENT_ID//[[:space:]]/} || -z ${TINYTRAC_GOOGLE_CLIENT_SECRET//[[:space:]]/} ]]; then
+            if [[ $GITHUB_EVENT_NAME == push ]]; then
+              echo '::error::Tag builds require TINYTRAC_GOOGLE_CLIENT_ID and TINYTRAC_GOOGLE_CLIENT_SECRET.'
+              exit 1
+            fi
+            echo '::warning::Dry run without Google sync: Google credentials are missing.'
+            echo 'Dry run: Google sync disabled because credentials are missing.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'TINYTRAC_GOOGLE_CLIENT_ID=' >> "$GITHUB_ENV"
+            echo 'TINYTRAC_GOOGLE_CLIENT_SECRET=' >> "$GITHUB_ENV"
+          fi
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        # ksni and Secret Service use pure-Rust zbus; SQLite is bundled.
+        # iced uses X11/Wayland/xkbcommon; no GTK or libappindicator is needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libx11-dev libxkbcommon-dev libwayland-dev
+      - name: Set up universal macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Import macOS signing identity
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          if [[ -z $MACOS_SIGNING_P12_BASE64 || -z $MACOS_SIGNING_P12_PASSWORD ]]; then
+            if [[ $GITHUB_EVENT_NAME == push ]]; then
+              echo '::error::Tag builds require MACOS_SIGNING_P12_BASE64 and MACOS_SIGNING_P12_PASSWORD.'
+              exit 1
+            fi
+            echo '::warning::Dry run uses ad-hoc signing: signing secrets are missing.'
+            echo 'Dry run: macOS bundle uses ad-hoc signing.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          umask 077
+          keychain="$RUNNER_TEMP/tinytrac-signing.keychain-db"
+          p12="$RUNNER_TEMP/tinytrac-signing.p12"
+          password=$(openssl rand -hex 32)
+          echo "::add-mask::$password"
+          printf '%s' "$MACOS_SIGNING_P12_BASE64" | base64 --decode > "$p12"
+          security list-keychains -d user > "$RUNNER_TEMP/tinytrac-keychains.txt"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          # Preserve the runner's existing search list, including paths with spaces.
+          python3 - <<'PY'
+          import os, shlex, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          previous = shlex.split((root / 'tinytrac-keychains.txt').read_text())
+          subprocess.run(['security', 'list-keychains', '-d', 'user', '-s',
+                          str(root / 'tinytrac-signing.keychain-db'), *previous], check=True)
+          PY
+          # Do not use -v (valid/trusted only): this identity is intentionally self-signed.
+          security find-identity -p codesigning "$keychain" | grep -F '"tinytrac"'
+          rm -f "$p12"
+          echo 'MACOS_SIGNING_IDENTITY=tinytrac' >> "$GITHUB_ENV"
+      - name: Build macOS DMG
+        if: runner.os == 'macOS'
+        run: scripts/bundle-macos.sh --universal --sign "${MACOS_SIGNING_IDENTITY:--}" --dmg
+      - name: Delete temporary signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          python3 - <<'PY'
+          import os, shlex, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          saved = root / 'tinytrac-keychains.txt'
+          try:
+              if saved.exists():
+                  subprocess.run(['security', 'list-keychains', '-d', 'user', '-s',
+                                  *shlex.split(saved.read_text())], check=True)
+          finally:
+              keychain = root / 'tinytrac-signing.keychain-db'
+              try:
+                  if keychain.exists():
+                      subprocess.run(['security', 'delete-keychain', str(keychain)], check=True)
+              finally:
+                  (root / 'tinytrac-signing.p12').unlink(missing_ok=True)
+                  saved.unlink(missing_ok=True)
+          PY
+      - name: Build and package Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked -p tinytrac
+          mkdir -p target/bundle/linux
+          install -m 755 target/release/tinytrac target/bundle/linux/tinytrac
+          install -m 644 assets/icon.png target/bundle/linux/icon.png
+          cat > target/bundle/linux/tinytrac.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=tinytrac
+          Comment=A tiny native time tracker
+          Exec=tinytrac
+          Icon=tinytrac
+          Terminal=false
+          Categories=Office;Utility;
+          DESKTOP
+          cat > target/bundle/linux/INSTALL.txt <<'INSTALL'
+          tinytrac for Linux x86_64 (Ubuntu 24.04 or compatible, glibc 2.39+)
+
+          Run these commands from the extracted directory:
+            install -Dm755 tinytrac "$HOME/.local/bin/tinytrac"
+            install -Dm644 tinytrac.desktop "$HOME/.local/share/applications/tinytrac.desktop"
+            install -Dm644 icon.png "$HOME/.local/share/icons/tinytrac.png"
+
+          Ensure ~/.local/bin is in your desktop session's PATH (log out/in after
+          first creating it). Launch tinytrac from your application menu or run
+          ~/.local/bin/tinytrac. Icon=tinytrac resolves the installed icon.
+          Runtime: X11 or Wayland, libxkbcommon, and graphics drivers (Mesa/Vulkan).
+          GNOME needs the AppIndicator extension for the tray; without a tray,
+          closing the window exits. Google sync needs a running Secret Service
+          such as GNOME Keyring and xdg-open for browser sign-in.
+          INSTALL
+          tar -C target/bundle/linux -czf "target/bundle/tinytrac-$VERSION-linux-x86_64.tar.gz" \
+            tinytrac tinytrac.desktop icon.png INSTALL.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tinytrac-${{ matrix.platform }}
+          path: |
+            target/bundle/tinytrac-*.dmg
+            target/bundle/tinytrac-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tinytrac-*
+          path: dist
+          merge-multiple: true
+      - name: Create draft release
+        working-directory: dist
+        run: |
+          macos="tinytrac-$VERSION-macos.dmg"
+          linux="tinytrac-$VERSION-linux-x86_64.tar.gz"
+          sha256sum "$macos" "$linux" > SHA256SUMS
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          - macOS 13+: universal DMG for Apple Silicon and Intel. Open the DMG and drag tinytrac to Applications.
+          - Linux x86_64: tarball for Ubuntu 24.04 or compatible, with binary, desktop entry, icon and INSTALL.txt.
+          - Both builds include Google Drive sync. SHA256SUMS contains asset checksums.
+
+          macOS releases are self-signed and are not notarized. On first launch, open tinytrac, then go to **System Settings → Privacy & Security → Open Anyway**, confirm, and open it again. Add tinytrac under **General → Login Items** to launch at login. Reopen its window from the menu bar.
+
+          Linux: extract the tarball and follow **INSTALL.txt**. GNOME needs the AppIndicator extension for the tray.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+            --title "tinytrac $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "$macos" "$linux" SHA256SUMS
